@@ -870,6 +870,85 @@ void BlueStore::LRUCache::_touch_onode(OnodeRef& o)
   onode_lru.push_front(*o);
 }
 
+void BlueStore::LRUCache::_trim_buffers()
+{
+  dout(20) << __func__  << " buffers " << buffer_size << " / " << buffer_max
+	   << dendl;
+
+  _audit("trim buffer start");
+
+  uint64_t buffer_max = buffer_max;
+  //uint64_t buffer_max = buffer_max.load(std::memory_order_relaxed);;
+  // buffers
+  while (buffer_size > buffer_max) {
+    auto i = buffer_lru.rbegin();
+    if (i == buffer_lru.rend()) {
+      // stop if buffer_lru is now empty
+      break;
+    }
+
+    Buffer *b = &*i;
+    assert(b->is_clean());
+    dout(20) << __func__ << " rm " << *b << dendl;
+    b->space->_rm_buffer(this, b);
+  }  
+}
+
+void BlueStore::LRUCache::_trim_onode()
+{
+  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << onode_max
+	   << dendl;
+
+  _audit("trim onode start");
+
+  uint64_t onode_max = onode_max;
+  //uint64_t onode_max = onode_max.load(std::memory_order_relaxed);;
+
+  // onodes
+  if (onode_max >= onode_lru.size()) {
+    return; // don't even try
+  }
+  uint64_t num = onode_lru.size() - onode_max;
+
+  auto p = onode_lru.end();
+  assert(p != onode_lru.begin());
+  --p;
+  int skipped = 0;
+  int max_skipped = g_conf->bluestore_cache_trim_max_skip_pinned;
+  while (num > 0) {
+    Onode *o = &*p;
+    int refs = o->nref.load();
+    if (refs > 1) {
+      dout(20) << __func__ << "  " << o->oid << " has " << refs
+	       << " refs, skipping" << dendl;
+      if (++skipped >= max_skipped) {
+        dout(20) << __func__ << " maximum skip pinned reached; stopping with "
+                 << num << " left to trim" << dendl;
+        break;
+      }
+
+      if (p == onode_lru.begin()) {
+        break;
+      } else {
+        p--;
+        num--;
+        continue;
+      }
+    }
+    dout(30) << __func__ << "  rm " << o->oid << dendl;
+    if (p != onode_lru.begin()) {
+      onode_lru.erase(p--);
+    } else {
+      onode_lru.erase(p);
+      assert(num == 1);
+    }
+    o->get();  // paranoia
+    o->c->onode_map.remove(o->oid);
+    o->put();
+    --num;
+  }
+}
+
 void BlueStore::LRUCache::_trim(uint64_t onode_max, uint64_t buffer_max)
 {
   dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << onode_max
@@ -1085,6 +1164,162 @@ void BlueStore::TwoQCache::_adjust_buffer_size(Buffer *b, int64_t delta)
     buffer_bytes += delta;
     assert((int64_t)buffer_list_bytes[b->cache_private] + delta >= 0);
     buffer_list_bytes[b->cache_private] += delta;
+  }
+}
+
+void BlueStore::TwoQCache::_trim_onode()
+{
+  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << onode_max
+	   << dendl;
+
+  _audit("trim start");
+  
+  uint64_t onode_max = onode_max;
+  // onodes
+  if (onode_max >= onode_lru.size()) {
+    return; // don't even try
+  }
+  uint64_t num = onode_lru.size() - onode_max;
+
+  auto p = onode_lru.end();
+  assert(p != onode_lru.begin());
+  --p;
+  int skipped = 0;
+  int max_skipped = g_conf->bluestore_cache_trim_max_skip_pinned;
+  while (num > 0) {
+    Onode *o = &*p;
+    dout(20) << __func__ << " considering " << o << dendl;
+    int refs = o->nref.load();
+    if (refs > 1) {
+      dout(20) << __func__ << "  " << o->oid << " has " << refs
+	       << " refs; skipping" << dendl;
+      if (++skipped >= max_skipped) {
+        dout(20) << __func__ << " maximum skip pinned reached; stopping with "
+                 << num << " left to trim" << dendl;
+        break;
+      }
+
+      if (p == onode_lru.begin()) {
+        break;
+      } else {
+        p--;
+        num--;
+        continue;
+      }
+    }
+    dout(30) << __func__ << " " << o->oid << " num=" << num <<" lru size="<<onode_lru.size()<< dendl;
+    if (p != onode_lru.begin()) {
+      onode_lru.erase(p--);
+    } else {
+      onode_lru.erase(p);
+      assert(num == 1);
+    }
+    o->get();  // paranoia
+    o->c->onode_map.remove(o->oid);
+    o->put();
+    --num;
+  }
+}
+
+void BlueStore::TwoQCache::_trim_buffers()
+{
+  dout(20) << " buffers " << buffer_bytes << " / " << buffer_max
+	   << dendl;
+
+  _audit("trim start");
+
+  uint64_t buffer_max = buffer_max;
+  // buffers
+  if (buffer_bytes > buffer_max) {
+    uint64_t kin = buffer_max * cct->_conf->bluestore_2q_cache_kin_ratio;
+    uint64_t khot = buffer_max - kin;
+
+    // pre-calculate kout based on average buffer size too,
+    // which is typical(the warm_in and hot lists may change later)
+    uint64_t kout = 0;
+    uint64_t buffer_num = buffer_hot.size() + buffer_warm_in.size();
+    if (buffer_num) {
+      uint64_t buffer_avg_size = buffer_bytes / buffer_num;
+      assert(buffer_avg_size);
+      uint64_t calculated_buffer_num = buffer_max / buffer_avg_size;
+      kout = calculated_buffer_num * cct->_conf->bluestore_2q_cache_kout_ratio;
+    }
+
+    if (buffer_list_bytes[BUFFER_HOT] < khot) {
+      // hot is small, give slack to warm_in
+      kin += khot - buffer_list_bytes[BUFFER_HOT];
+    } else if (buffer_list_bytes[BUFFER_WARM_IN] < kin) {
+      // warm_in is small, give slack to hot
+      khot += kin - buffer_list_bytes[BUFFER_WARM_IN];
+    }
+
+    // adjust warm_in list
+    int64_t to_evict_bytes = buffer_list_bytes[BUFFER_WARM_IN] - kin;
+    uint64_t evicted = 0;
+
+    while (to_evict_bytes > 0) {
+      auto p = buffer_warm_in.rbegin();
+      if (p == buffer_warm_in.rend()) {
+        // stop if warm_in list is now empty
+        break;
+      }
+
+      Buffer *b = &*p;
+      assert(b->is_clean());
+      dout(20) << __func__ << " buffer_warm_in -> out " << *b << dendl;
+      assert(buffer_bytes >= b->length);
+      buffer_bytes -= b->length;
+      assert(buffer_list_bytes[BUFFER_WARM_IN] >= b->length);
+      buffer_list_bytes[BUFFER_WARM_IN] -= b->length;
+      to_evict_bytes -= b->length;
+      evicted += b->length;
+      b->state = Buffer::STATE_EMPTY;
+      b->data.clear();
+      buffer_warm_in.erase(buffer_warm_in.iterator_to(*b));
+      buffer_warm_out.push_front(*b);
+      b->cache_private = BUFFER_WARM_OUT;
+    }
+
+    if (evicted > 0) {
+      dout(20) << __func__ << " evicted " << byte_u_t(evicted)
+               << " from warm_in list, done evicting warm_in buffers"
+               << dendl;
+    }
+
+    // adjust hot list
+    to_evict_bytes = buffer_list_bytes[BUFFER_HOT] - khot;
+    evicted = 0;
+
+    while (to_evict_bytes > 0) {
+      auto p = buffer_hot.rbegin();
+      if (p == buffer_hot.rend()) {
+        // stop if hot list is now empty
+        break;
+      }
+
+      Buffer *b = &*p;
+      dout(20) << __func__ << " buffer_hot rm " << *b << dendl;
+      assert(b->is_clean());
+      // adjust evict size before buffer goes invalid
+      to_evict_bytes -= b->length;
+      evicted += b->length;
+      b->space->_rm_buffer(this, b);
+    }
+
+    if (evicted > 0) {
+      dout(20) << __func__ << " evicted " << byte_u_t(evicted)
+               << " from hot list, done evicting hot buffers"
+               << dendl;
+    }
+
+    // adjust warm out list too, if necessary
+    int64_t num = buffer_warm_out.size() - kout;
+    while (num-- > 0) {
+      Buffer *b = &*buffer_warm_out.rbegin();
+      assert(b->is_empty());
+      dout(20) << __func__ << " buffer_warm_out rm " << *b << dendl;
+      b->space->_rm_buffer(this, b);
+    }
   }
 }
 
@@ -1467,6 +1702,7 @@ void BlueStore::BufferSpace::_finish_write(Cache* cache, uint64_t seq)
     }
   }
 
+  cache->_trim_buffers();
   cache->_audit("finish_write end");
 }
 
@@ -1518,6 +1754,7 @@ void BlueStore::BufferSpace::split(Cache* cache, size_t pos, BlueStore::BufferSp
     }
   }
   assert(writing.empty());
+  cache->_trim_buffers();
 }
 
 // OnodeSpace
@@ -1538,6 +1775,7 @@ BlueStore::OnodeRef BlueStore::OnodeSpace::add(const ghobject_t& oid, OnodeRef o
   ldout(cache->cct, 30) << __func__ << " " << oid << " " << o << dendl;
   onode_map[oid] = o;
   cache->_add_onode(o, 1);
+  cache->_trim_onode();
   return o;
 }
 
@@ -1618,6 +1856,7 @@ void BlueStore::OnodeSpace::rename(
   cache->_touch_onode(o);
   o->oid = new_oid;
   o->key = new_okey;
+  cache->_trim_onode();
 }
 
 bool BlueStore::OnodeSpace::map_any(std::function<bool(OnodeRef)> f)
@@ -3372,6 +3611,8 @@ void BlueStore::Collection::split_cache(
       }
     }
   }
+  dest->cache->_trim_onode();
+  dest->cache->_trim_buffers();
 }
 
 // =======================================================
@@ -3494,7 +3735,9 @@ void BlueStore::MempoolThread::_trim_shards(bool interval_stats)
                  << " max_shard_buffer: " << max_shard_buffer << dendl;
 
   for (auto i : store->cache_shards) {
-    i->trim(max_shard_onodes, max_shard_buffer);
+    i->set_onode_max(max_shard_onodes);
+    i->set_buffer_max(max_shard_buffer);
+    //i->trim(max_shard_onodes, max_shard_buffer);
   }
 }
 

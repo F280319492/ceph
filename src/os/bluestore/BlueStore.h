@@ -325,7 +325,9 @@ public:
     // return value is the highest cache_private of a trimmed buffer, or 0.
     int discard(Cache* cache, uint32_t offset, uint32_t length) {
       std::lock_guard<std::recursive_mutex> l(cache->lock);
-      return _discard(cache, offset, length);
+      int ret = _discard(cache, offset, length);
+      cache->_trim_buffers();
+      return ret;
     }
     int _discard(Cache* cache, uint32_t offset, uint32_t length);
 
@@ -336,6 +338,7 @@ public:
 			     flags);
       b->cache_private = _discard(cache, offset, bl.length());
       _add_buffer(cache, b, (flags & Buffer::FLAG_NOCACHE) ? 0 : 1, nullptr);
+      cache->_trim_buffers();
     }
     void _finish_write(Cache* cache, uint64_t seq);
     void did_read(Cache* cache, uint32_t offset, bufferlist& bl) {
@@ -343,6 +346,7 @@ public:
       Buffer *b = new Buffer(this, Buffer::STATE_CLEAN, 0, offset, bl);
       b->cache_private = _discard(cache, offset, bl.length());
       _add_buffer(cache, b, 1, nullptr);
+      cache->_trim_buffers();
     }
 
     void read(Cache* cache, uint32_t offset, uint32_t length,
@@ -1105,6 +1109,8 @@ public:
     void trim_all();
 
     virtual void _trim(uint64_t onode_max, uint64_t buffer_max) = 0;
+    virtual void _trim_onode() = 0;
+    virtual void _trim_buffers() = 0;
 
     virtual void add_stats(uint64_t *onodes, uint64_t *extents,
 			   uint64_t *blobs,
@@ -1144,8 +1150,19 @@ public:
     buffer_lru_list_t buffer_lru;
     uint64_t buffer_size = 0;
 
+    std::atomic<uint64_t> onode_max = {0};
+    std::atomic<uint64_t> buffer_max = {0};
+
   public:
     LRUCache(CephContext* cct) : Cache(cct) {}
+    void set_onode_max(uint64_t max_) {
+      onode_max = max_;
+      //onode_max.store(max_,std::memory_order_relaxed)
+    }
+    void set_buffer_max(uint64_t max_) {
+      buffer_max = max_;
+      //buffer_max.store(max_,std::memory_order_relaxed)
+    }
     uint64_t _get_num_onodes() override {
       return onode_lru.size();
     }
@@ -1197,6 +1214,8 @@ public:
     }
 
     void _trim(uint64_t onode_max, uint64_t buffer_max) override;
+    void _trim_onode() override;
+    void _trim_buffers() override;
 
     void add_stats(uint64_t *onodes, uint64_t *extents,
 		   uint64_t *blobs,
@@ -1248,9 +1267,21 @@ public:
     };
 
     uint64_t buffer_list_bytes[BUFFER_TYPE_MAX] = {0}; ///< bytes per type
+    std::atomic<uint64_t> onode_max = {0};
+    std::atomic<uint64_t> buffer_max = {0};
 
   public:
     TwoQCache(CephContext* cct) : Cache(cct) {}
+
+    void set_onode_max(uint64_t max_) {
+      onode_max = max_;
+      //onode_max.store(max_,std::memory_order_relaxed)
+    }
+    void set_buffer_max(uint64_t max_) {
+      buffer_max = max_;
+      //buffer_max.store(max_,std::memory_order_relaxed)
+    }
+
     uint64_t _get_num_onodes() override {
       return onode_lru.size();
     }
@@ -1292,6 +1323,8 @@ public:
     }
 
     void _trim(uint64_t onode_max, uint64_t buffer_max) override;
+    void _trim_onode() override;
+    void _trim_buffers() override;
 
     void add_stats(uint64_t *onodes, uint64_t *extents,
 		   uint64_t *blobs,
