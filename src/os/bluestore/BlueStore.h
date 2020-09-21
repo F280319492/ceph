@@ -1111,6 +1111,8 @@ public:
     virtual void _trim(uint64_t onode_max, uint64_t buffer_max) = 0;
     virtual void _trim_onode() = 0;
     virtual void _trim_buffers() = 0;
+    virtual void set_onode_max(uint64_t max) = 0;
+    virtual void set_buffer_max(uint64_t max) = 0;
 
     virtual void add_stats(uint64_t *onodes, uint64_t *extents,
 			   uint64_t *blobs,
@@ -1150,18 +1152,18 @@ public:
     buffer_lru_list_t buffer_lru;
     uint64_t buffer_size = 0;
 
-    std::atomic<uint64_t> onode_max = {0};
-    std::atomic<uint64_t> buffer_max = {0};
+    std::atomic<uint64_t> _onode_max = {0};
+    std::atomic<uint64_t> _buffer_max = {0};
 
   public:
     LRUCache(CephContext* cct) : Cache(cct) {}
-    void set_onode_max(uint64_t max_) {
-      onode_max = max_;
-      //onode_max.store(max_,std::memory_order_relaxed)
+    void set_onode_max(uint64_t max_) override {
+      _onode_max = max_;
+      //_onode_max.store(max_,std::memory_order_relaxed)
     }
-    void set_buffer_max(uint64_t max_) {
-      buffer_max = max_;
-      //buffer_max.store(max_,std::memory_order_relaxed)
+    void set_buffer_max(uint64_t max_) override {
+      _buffer_max = max_;
+      //_buffer_max.store(max_,std::memory_order_relaxed)
     }
     uint64_t _get_num_onodes() override {
       return onode_lru.size();
@@ -1267,19 +1269,19 @@ public:
     };
 
     uint64_t buffer_list_bytes[BUFFER_TYPE_MAX] = {0}; ///< bytes per type
-    std::atomic<uint64_t> onode_max = {0};
-    std::atomic<uint64_t> buffer_max = {0};
+    std::atomic<uint64_t> _onode_max = {0};
+    std::atomic<uint64_t> _buffer_max = {0};
 
   public:
     TwoQCache(CephContext* cct) : Cache(cct) {}
 
-    void set_onode_max(uint64_t max_) {
-      onode_max = max_;
-      //onode_max.store(max_,std::memory_order_relaxed)
+    void set_onode_max(uint64_t max_) override {
+      _onode_max = max_;
+      //_onode_max.store(max_,std::memory_order_relaxed)
     }
-    void set_buffer_max(uint64_t max_) {
-      buffer_max = max_;
-      //buffer_max.store(max_,std::memory_order_relaxed)
+    void set_buffer_max(uint64_t max_) override {
+      _buffer_max = max_;
+      //_buffer_max.store(max_,std::memory_order_relaxed)
     }
 
     uint64_t _get_num_onodes() override {

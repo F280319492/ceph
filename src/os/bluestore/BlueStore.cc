@@ -872,12 +872,12 @@ void BlueStore::LRUCache::_touch_onode(OnodeRef& o)
 
 void BlueStore::LRUCache::_trim_buffers()
 {
-  dout(20) << __func__  << " buffers " << buffer_size << " / " << buffer_max
+  dout(20) << __func__  << " buffers " << buffer_size << " / " << _buffer_max
 	   << dendl;
 
   _audit("trim buffer start");
 
-  uint64_t buffer_max = buffer_max;
+  uint64_t buffer_max = _buffer_max;
   //uint64_t buffer_max = buffer_max.load(std::memory_order_relaxed);;
   // buffers
   while (buffer_size > buffer_max) {
@@ -896,12 +896,12 @@ void BlueStore::LRUCache::_trim_buffers()
 
 void BlueStore::LRUCache::_trim_onode()
 {
-  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << onode_max
+  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << _onode_max
 	   << dendl;
 
   _audit("trim onode start");
 
-  uint64_t onode_max = onode_max;
+  uint64_t onode_max = _onode_max;
   //uint64_t onode_max = onode_max.load(std::memory_order_relaxed);;
 
   // onodes
@@ -1169,12 +1169,12 @@ void BlueStore::TwoQCache::_adjust_buffer_size(Buffer *b, int64_t delta)
 
 void BlueStore::TwoQCache::_trim_onode()
 {
-  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << onode_max
+  dout(20) << __func__ << " onodes " << onode_lru.size() << " / " << _onode_max
 	   << dendl;
 
   _audit("trim start");
   
-  uint64_t onode_max = onode_max;
+  uint64_t onode_max = _onode_max;
   // onodes
   if (onode_max >= onode_lru.size()) {
     return; // don't even try
@@ -1223,12 +1223,12 @@ void BlueStore::TwoQCache::_trim_onode()
 
 void BlueStore::TwoQCache::_trim_buffers()
 {
-  dout(20) << " buffers " << buffer_bytes << " / " << buffer_max
+  dout(20) << " buffers " << buffer_bytes << " / " << _buffer_max
 	   << dendl;
 
   _audit("trim start");
 
-  uint64_t buffer_max = buffer_max;
+  uint64_t buffer_max = _buffer_max;
   // buffers
   if (buffer_bytes > buffer_max) {
     uint64_t kin = buffer_max * cct->_conf->bluestore_2q_cache_kin_ratio;
