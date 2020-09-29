@@ -74,6 +74,7 @@ class RocksDBStore : public KeyValueDB {
   rocksdb::Env *env;
   std::shared_ptr<rocksdb::Statistics> dbstats;
   rocksdb::BlockBasedTableOptions bbt_opts;
+  rocksdb::ColumnFamilyHandle *default_cf = nullptr;
   string options_str;
 
   uint64_t cache_size = 0;
@@ -157,6 +158,14 @@ public:
   int create_and_open(ostream &out) override;
 
   void close() override;
+
+  rocksdb::ColumnFamilyHandle *get_cf_handle(const std::string& cf_name) {
+    auto iter = cf_handles.find(cf_name);
+    if (iter == cf_handles.end())
+      return nullptr;
+    else
+      return static_cast<rocksdb::ColumnFamilyHandle*>(iter->second);
+  }
 
   void split_stats(const std::string &s, char delim, std::vector<std::string> &elems);
   void get_statistics(Formatter *f) override;
@@ -266,6 +275,13 @@ public:
     RocksDBStore *db;
 
     explicit RocksDBTransactionImpl(RocksDBStore *_db);
+  private:
+    void put_bat(
+      rocksdb::WriteBatch& bat,
+      rocksdb::ColumnFamilyHandle *cf,
+      const string &k,
+      const bufferlist &to_set_bl);
+  public:
     void set(
       const string &prefix,
       const string &k,

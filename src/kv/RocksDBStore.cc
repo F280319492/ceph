@@ -627,23 +627,39 @@ RocksDBStore::RocksDBTransactionImpl::RocksDBTransactionImpl(RocksDBStore *_db)
   db = _db;
 }
 
+void RocksDBStore::RocksDBTransactionImpl::put_bat(
+  rocksdb::WriteBatch& bat,
+  rocksdb::ColumnFamilyHandle *cf,
+  const string &key,
+  const bufferlist &to_set_bl)
+{
+  // bufferlist::c_str() is non-constant, so we can't call c_str()
+  if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
+    bat.Put(cf,
+	    rocksdb::Slice(key),
+	    rocksdb::Slice(to_set_bl.buffers().front().c_str(),
+			   to_set_bl.length()));
+  } else {
+    rocksdb::Slice key_slice(key);
+    vector<rocksdb::Slice> value_slices(to_set_bl.get_num_buffers());
+    bat.Put(cf,
+	    rocksdb::SliceParts(&key_slice, 1),
+            prepare_sliceparts(to_set_bl, &value_slices));
+  }
+}
+
+
 void RocksDBStore::RocksDBTransactionImpl::set(
   const string &prefix,
   const string &k,
   const bufferlist &to_set_bl)
 {
-  string key = combine_strings(prefix, k);
-
-  // bufferlist::c_str() is non-constant, so we can't call c_str()
-  if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
-    bat.Put(rocksdb::Slice(key),
-	     rocksdb::Slice(to_set_bl.buffers().front().c_str(),
-			    to_set_bl.length()));
+  auto cf = db->get_cf_handle(prefix);
+  if(cf) {
+    put_bat(bat, cf, k, to_set_bl);
   } else {
-    rocksdb::Slice key_slice(key);
-    vector<rocksdb::Slice> value_slices(to_set_bl.buffers().size());
-    bat.Put(nullptr, rocksdb::SliceParts(&key_slice, 1),
-            prepare_sliceparts(to_set_bl, &value_slices));
+    string key = combine_strings(prefix, k);
+    put_bat(bat, db->default_cf, key, to_set_bl);
   }
 }
 
@@ -652,56 +668,77 @@ void RocksDBStore::RocksDBTransactionImpl::set(
   const char *k, size_t keylen,
   const bufferlist &to_set_bl)
 {
-  string key;
-  combine_strings(prefix, k, keylen, &key);
-
-  // bufferlist::c_str() is non-constant, so we can't call c_str()
-  if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
-    bat.Put(rocksdb::Slice(key),
-	     rocksdb::Slice(to_set_bl.buffers().front().c_str(),
-			    to_set_bl.length()));
+  auto cf = db->get_cf_handle(prefix);
+  if(cf) {
+    string key(k, keylen);  // fixme?
+    put_bat(bat, cf, key, to_set_bl);
   } else {
-    rocksdb::Slice key_slice(key);
-    vector<rocksdb::Slice> value_slices(to_set_bl.buffers().size());
-    bat.Put(nullptr, rocksdb::SliceParts(&key_slice, 1),
-            prepare_sliceparts(to_set_bl, &value_slices));
+    string key;
+    combine_strings(prefix, k, keylen, &key);
+    put_bat(bat, cf, key, to_set_bl);
   }
 }
 
 void RocksDBStore::RocksDBTransactionImpl::rmkey(const string &prefix,
 					         const string &k)
 {
-  bat.Delete(combine_strings(prefix, k));
+  auto cf = db->get_cf_handle(prefix);
+  if (cf) {
+    bat.Delete(cf, rocksdb::Slice(k));
+  } else {
+    bat.Delete(db->default_cf, combine_strings(prefix, k));
+  }
 }
 
 void RocksDBStore::RocksDBTransactionImpl::rmkey(const string &prefix,
 					         const char *k,
 						 size_t keylen)
 {
-  string key;
-  combine_strings(prefix, k, keylen, &key);
-  bat.Delete(key);
+  auto cf = db->get_cf_handle(prefix);
+  if (cf) {
+    bat.Delete(cf, rocksdb::Slice(k, keylen));
+  } else {
+    string key;
+    combine_strings(prefix, k, keylen, &key);
+    bat.Delete(db->default_cf, rocksdb::Slice(key));
+  }
 }
 
 void RocksDBStore::RocksDBTransactionImpl::rm_single_key(const string &prefix,
 					                 const string &k)
 {
-  bat.SingleDelete(combine_strings(prefix, k));
+  auto cf = db->get_cf_handle(prefix);
+  if (cf) {
+    bat.SingleDelete(cf, k);
+  } else {
+    bat.SingleDelete(db->default_cf, combine_strings(prefix, k));
+  }
 }
 
 void RocksDBStore::RocksDBTransactionImpl::rmkeys_by_prefix(const string &prefix)
 {
+  auto cf = db->get_cf_handle(prefix);
+
   if (db->enable_rmrange) {
     string endprefix = prefix;
     endprefix.push_back('\x01');
-    bat.DeleteRange(combine_strings(prefix, string()),
+    if(cf) {
+      bat.DeleteRange(cf,
+        string(),
 		    combine_strings(endprefix, string()));
+    } else {
+      bat.DeleteRange(db->default_cf,
+        combine_strings(prefix, string()),
+		    combine_strings(endprefix, string()));
+    }
   } else {
     KeyValueDB::Iterator it = db->get_iterator(prefix);
-    for (it->seek_to_first();
-	 it->valid();
-	 it->next()) {
-      bat.Delete(combine_strings(prefix, it->key()));
+    for (it->seek_to_first(); it->valid(); it->next()) {
+      if(cf) {
+        bat.Delete(cf, rocksdb::Slice(it->key()));
+      } else {
+        bat.Delete(db->default_cf, combine_strings(prefix, it->key()));
+      }
     }
   }
 }
@@ -710,8 +747,14 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
                                                          const string &start,
                                                          const string &end)
 {
+  auto cf = db->get_cf_handle(prefix);
+
   if (db->enable_rmrange) {
-    bat.DeleteRange(combine_strings(prefix, start), combine_strings(prefix, end));
+    if(cf) {
+      bat.DeleteRange(cf, rocksdb::Slice(start), rocksdb::Slice(end));
+    } else {
+      bat.DeleteRange(db->default_cf, combine_strings(prefix, start), combine_strings(prefix, end));
+    }
   } else {
     auto it = db->get_iterator(prefix);
     it->lower_bound(start);
@@ -719,7 +762,11 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
       if (it->key() >= end) {
         break;
       }
-      bat.Delete(combine_strings(prefix, it->key()));
+      if(cf) {
+        bat.Delete(cf, rocksdb::Slice(it->key()));
+      } else {
+        bat.Delete(db->default_cf, combine_strings(prefix, it->key()));
+      }
       it->next();
     }
   }
@@ -730,19 +777,35 @@ void RocksDBStore::RocksDBTransactionImpl::merge(
   const string &k,
   const bufferlist &to_set_bl)
 {
-  string key = combine_strings(prefix, k);
+  auto cf = db->get_cf_handle(prefix);
 
-  // bufferlist::c_str() is non-constant, so we can't call c_str()
-  if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
-    bat.Merge(rocksdb::Slice(key),
-	       rocksdb::Slice(to_set_bl.buffers().front().c_str(),
-			    to_set_bl.length()));
+  if(cf) {
+    // bufferlist::c_str() is non-constant, so we can't call c_str()
+    if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
+      bat.Merge(cf, rocksdb::Slice(k),
+          rocksdb::Slice(to_set_bl.buffers().front().c_str(),
+            to_set_bl.length()));
+    } else {
+      // make a copy
+      rocksdb::Slice key_slice(k);
+      vector<rocksdb::Slice> value_slices(to_set_bl.buffers().size());
+      bat.Merge(cf, rocksdb::SliceParts(&key_slice, 1),
+                prepare_sliceparts(to_set_bl, &value_slices));
+    }
   } else {
-    // make a copy
-    rocksdb::Slice key_slice(key);
-    vector<rocksdb::Slice> value_slices(to_set_bl.buffers().size());
-    bat.Merge(nullptr, rocksdb::SliceParts(&key_slice, 1),
-              prepare_sliceparts(to_set_bl, &value_slices));
+    string key = combine_strings(prefix, k);
+    // bufferlist::c_str() is non-constant, so we can't call c_str()
+    if (to_set_bl.is_contiguous() && to_set_bl.length() > 0) {
+      bat.Merge(db->default_cf, rocksdb::Slice(key),
+          rocksdb::Slice(to_set_bl.buffers().front().c_str(),
+            to_set_bl.length()));
+    } else {
+      // make a copy
+      rocksdb::Slice key_slice(key);
+      vector<rocksdb::Slice> value_slices(to_set_bl.buffers().size());
+      bat.Merge(db->default_cf, rocksdb::SliceParts(&key_slice, 1),
+                prepare_sliceparts(to_set_bl, &value_slices));
+    }
   }
 }
 
@@ -753,11 +816,21 @@ int RocksDBStore::get(
     std::map<string, bufferlist> *out)
 {
   utime_t start = ceph_clock_now();
+  auto cf = get_cf_handle(prefix);
+  rocksdb::Status status;
   for (std::set<string>::const_iterator i = keys.begin();
        i != keys.end(); ++i) {
     std::string value;
-    std::string bound = combine_strings(prefix, *i);
-    auto status = db->Get(rocksdb::ReadOptions(), rocksdb::Slice(bound), &value);
+
+    if(cf) {
+      status = db->Get(rocksdb::ReadOptions(), cf,
+        rocksdb::Slice(*i), &value);
+    } else {
+      std::string bound = combine_strings(prefix, *i);
+      status = db->Get(rocksdb::ReadOptions(), default_cf,
+        rocksdb::Slice(bound), &value);
+    }
+    
     if (status.ok()) {
       (*out)[*i].append(value);
     } else if (status.IsIOError()) {
@@ -781,8 +854,20 @@ int RocksDBStore::get(
   int r = 0;
   string value, k;
   rocksdb::Status s;
-  k = combine_strings(prefix, key);
-  s = db->Get(rocksdb::ReadOptions(), rocksdb::Slice(k), &value);
+  auto cf = get_cf_handle(prefix);
+  if(cf) {
+    s = db->Get(rocksdb::ReadOptions(),
+      cf,
+      rocksdb::Slice(key),
+      &value);
+  } else {
+    k = combine_strings(prefix, key);
+    s = db->Get(rocksdb::ReadOptions(),
+      default_cf,
+      rocksdb::Slice(k),
+      &value);
+  }
+  
   if (s.ok()) {
     out->append(value);
   } else if (s.IsNotFound()) {
@@ -806,9 +891,15 @@ int RocksDBStore::get(
   utime_t start = ceph_clock_now();
   int r = 0;
   string value, k;
-  combine_strings(prefix, key, keylen, &k);
   rocksdb::Status s;
-  s = db->Get(rocksdb::ReadOptions(), rocksdb::Slice(k), &value);
+  auto cf = get_cf_handle(prefix);
+  if(cf) {
+    s = db->Get(rocksdb::ReadOptions(), cf, rocksdb::Slice(key), &value);
+  } else {
+    combine_strings(prefix, key, keylen, &k);
+    s = db->Get(rocksdb::ReadOptions(), default_cf, rocksdb::Slice(k), &value);
+  }
+  
   if (s.ok()) {
     out->append(value);
   } else if (s.IsNotFound()) {

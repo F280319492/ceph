@@ -428,6 +428,9 @@ protected:
   /// List of matching prefixes and merge operators
   std::vector<std::pair<std::string,
 			std::shared_ptr<MergeOperator> > > merge_ops;
+  
+  /// column families in use, name->handle
+  std::unordered_map<std::string, void *> cf_handles;
 
   virtual WholeSpaceIterator _get_iterator() = 0;
 };
