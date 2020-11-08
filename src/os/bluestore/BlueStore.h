@@ -1493,6 +1493,67 @@ public:
     }
   };
 
+  // --------------------------------------------------------
+  // intermediate data structures used while reading
+  struct region_t {
+    uint64_t logical_offset;
+    uint64_t blob_xoffset;   //region offset within the blob
+    uint64_t length;
+    bufferlist bl;
+
+    // used later in read process
+    uint64_t front = 0;
+    uint64_t r_off = 0;
+
+    region_t(uint64_t offset, uint64_t b_offs, uint64_t len)
+      : logical_offset(offset),
+      blob_xoffset(b_offs),
+      length(len){}
+    region_t(const region_t& from)
+      : logical_offset(from.logical_offset),
+      blob_xoffset(from.blob_xoffset),
+      length(from.length){}
+
+    friend ostream& operator<<(ostream& out, const region_t& r) {
+      return out << "0x" << std::hex << r.logical_offset << ":"
+        << r.blob_xoffset << "~" << r.length << std::dec;
+    }
+  };
+  typedef list<region_t> regions2read_t;
+  typedef map<BlueStore::BlobRef, regions2read_t> blobs2read_t;
+  
+  struct io_context_read_result_t {
+    OnodeRef o;
+    uint64_t offset;
+    size_t length;
+    ready_regions_t ready_regions;
+    vector<bufferlist> compressed_blob_bls;
+    blobs2read_t blobs2read;
+    bool buffered;
+  };
+  void _read_cache(
+    OnodeRef o,
+    uint64_t offset,
+    size_t length,
+    int read_cache_policy,
+    ready_regions_t& ready_regions,
+    blobs2read_t& blobs2read);
+
+  int _prepare_read_ioc(
+    blobs2read_t& blobs2read,
+    vector<bufferlist>* compressed_blob_bls,
+    IOContext* ioc);
+
+  int _generate_read_result_bl(
+    OnodeRef o,
+    uint64_t offset,
+    size_t length,
+    ready_regions_t& ready_regions,
+    vector<bufferlist>& compressed_blob_bls,
+    blobs2read_t& blobs2read,
+    bool buffered,
+    bool* csum_error,
+    bufferlist& bl);
   struct TransContext : public AioContext {
     MEMPOOL_CLASS_HELPERS();
 
