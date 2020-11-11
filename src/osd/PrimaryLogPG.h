@@ -551,6 +551,9 @@ public:
 
     PrimaryLogPG *pg;
 
+    int async_read_rval;
+    Context *async_read_on_complete;
+    int num_async_read;   ///< count async read ops
     int num_read;    ///< count read ops
     int num_write;   ///< count update ops
 
@@ -613,6 +616,9 @@ public:
       current_osd_subop_num(0),
       obc(obc),
       reply(NULL), pg(_pg),
+      async_read_rval(0),
+      async_read_on_complete(nullptr),
+      num_async_read(0),
       num_read(0),
       num_write(0),
       sent_reply(false),
@@ -631,6 +637,9 @@ public:
       bytes_written(0), bytes_read(0), user_at_version(0),
       current_osd_subop_num(0),
       reply(NULL), pg(_pg),
+      async_read_rval(0),
+      async_read_on_complete(nullptr),
+      num_async_read(0),
       num_read(0),
       num_write(0),
       inflightreads(0),
@@ -1350,7 +1359,7 @@ protected:
 
   friend class C_ExtentCmpRead;
 
-  int do_read(OpContext *ctx, OSDOp& osd_op);
+  int do_read(OpContext *ctx, OSDOp& osd_op, bool sync = true);
   int do_sparse_read(OpContext *ctx, OSDOp& osd_op);
   int do_writesame(OpContext *ctx, OSDOp& osd_op);
 

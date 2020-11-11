@@ -254,10 +254,11 @@ void PrimaryLogPG::OpContext::start_async_reads(PrimaryLogPG *pg)
   list<pair<boost::tuple<uint64_t, uint64_t, unsigned>,
 	    pair<bufferlist*, Context*> > > in;
   in.swap(pending_async_reads);
+  this->async_read_on_complete = new OnReadComplete(pg, this);
   pg->pgbackend->objects_read_async(
     obc->obs.oi.soid,
     in,
-    new OnReadComplete(pg, this), pg->get_pool().fast_read);
+    this->async_read_on_complete, pg->get_pool().fast_read);
 }
 void PrimaryLogPG::OpContext::finish_read(PrimaryLogPG *pg)
 {
@@ -4443,6 +4444,76 @@ static int check_offset_and_length(uint64_t offset, uint64_t length, uint64_t ma
   return 0;
 }
 
+struct AsyncReadCallback : public GenContext<ThreadPool::TPHandle &>
+{
+  int r;
+  Context *c;
+  AsyncReadCallback(int r, Context *c) : r(r), c(c) {}
+  void finish(ThreadPool::TPHandle &) override
+  {
+    c->complete(r);
+    c = NULL;
+  }
+  ~AsyncReadCallback() override
+  {
+    delete c;
+  }
+};
+
+struct FillInVerifyExtentV2 : public Context {
+  ceph_le64 *r;
+  int32_t *rval;
+  bufferlist *outdatap;
+  boost::optional<uint32_t> maybe_crc;
+  uint64_t size;
+  OSDService *osd;
+  PrimaryLogPG::OpContext *op_ctx;
+  hobject_t soid;
+  __le32 flags;
+  FillInVerifyExtentV2(ceph_le64 *r, int32_t *rv, bufferlist *blp,
+		     boost::optional<uint32_t> mc, uint64_t size,
+		     OSDService *osd, PrimaryLogPG::OpContext *ctx, hobject_t soid, __le32 flags) :
+    r(r), rval(rv), outdatap(blp), maybe_crc(mc),
+    size(size), osd(osd), op_ctx(ctx), soid(soid), flags(flags) {}
+  void finish(int len) override {
+    op_ctx->num_async_read--;
+    *r = len;
+    if (len < 0) {
+      *rval = len;
+      //return;
+    } else {
+      *rval = 0;
+
+      // whole object?  can we verify the checksum?
+      if (maybe_crc && *r == size) {
+        uint32_t crc = outdatap->crc32c(-1);
+        if (maybe_crc != crc) {
+          osd->clog->error() << std::hex << " full-object read crc 0x" << crc
+      		   << " != expected 0x" << *maybe_crc
+      		   << std::dec << " on " << soid;
+          if (!(flags & CEPH_OSD_OP_FLAG_FAILOK)) {
+            *rval = -EIO;
+            *r = 0;
+          }
+        }
+      }
+    }
+    if(*rval < 0) {
+      op_ctx->async_read_rval = *rval;
+    }
+    //all async read finished
+    if(op_ctx->num_async_read == 0) {
+      if(op_ctx->async_read_on_complete) {
+        op_ctx->pg->schedule_recovery_work(
+            op_ctx->pg->bless_gencontext(
+                new AsyncReadCallback(op_ctx->async_read_rval, op_ctx->async_read_on_complete)));
+      } else {
+        osd->clog->error() << "op_ctx->num_async_read is null!";
+      }
+    }
+  }
+};
+
 struct FillInVerifyExtent : public Context {
   ceph_le64 *r;
   int32_t *rval;
@@ -4452,11 +4523,22 @@ struct FillInVerifyExtent : public Context {
   OSDService *osd;
   hobject_t soid;
   __le32 flags;
+  PrimaryLogPG::OpContext *ctx;
+  OSDOp osd_op;
   FillInVerifyExtent(ceph_le64 *r, int32_t *rv, bufferlist *blp,
 		     boost::optional<uint32_t> mc, uint64_t size,
-		     OSDService *osd, hobject_t soid, __le32 flags) :
+		     OSDService *osd, hobject_t soid, __le32 flags,
+             PrimaryLogPG::OpContext *op_ctx, OSDOp &osd_op) :
     r(r), rval(rv), outdatap(blp), maybe_crc(mc),
-    size(size), osd(osd), soid(soid), flags(flags) {}
+    size(size), osd(osd), soid(soid), flags(flags),
+    ctx(op_ctx), osd_op(osd_op){}
+  FillInVerifyExtent(ceph_le64 *r, int32_t *rv, bufferlist *blp,
+             boost::optional<uint32_t> mc, uint64_t size,
+             OSDService *osd, hobject_t soid, __le32 flags) :
+    r(r), rval(rv), outdatap(blp), maybe_crc(mc),
+    size(size), osd(osd), soid(soid), flags(flags),
+    ctx(nullptr){}
+
   void finish(int len) override {
     *r = len;
     if (len < 0) {
@@ -4881,7 +4963,7 @@ int PrimaryLogPG::finish_extent_cmp(OSDOp& osd_op, const bufferlist &read_bl)
   return 0;
 }
 
-int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
+int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op, bool sync) {
   dout(20) << __func__ << dendl;
   auto& op = osd_op.op;
   auto& oi = ctx->new_obs.oi;
@@ -4919,6 +5001,10 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
 
   // read into a buffer
   int result = 0;
+  boost::optional<uint32_t> maybe_crc;
+  if (oi.is_data_digest() && op.extent.offset == 0 &&
+      op.extent.length >= oi.size)
+    maybe_crc = oi.data_digest;
   if (trimmed_read && op.extent.length == 0) {
     // read size was trimmed to zero and it is expected to do nothing
     // a read operation of 0 bytes does *not* do nothing, this is why
@@ -4938,12 +5024,12 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
         make_pair(&osd_op.outdata,
 		  new FillInVerifyExtent(&op.extent.length, &osd_op.rval,
 					 &osd_op.outdata, maybe_crc, oi.size,
-					 osd, soid, op.flags))));
+					 osd, soid, op.flags, ctx, osd_op))));
     dout(10) << " async_read noted for " << soid << dendl;
 
     ctx->op_finishers[ctx->current_osd_subop_num].reset(
       new ReadFinisher(osd_op));
-  } else {
+  } else if (sync) {
     int r = pgbackend->objects_read_sync(
       soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
     // whole object?  can we verify the checksum?
@@ -4974,6 +5060,17 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
     }
     dout(10) << " read got " << r << " / " << op.extent.length
 	     << " bytes from obj " << soid << dendl;
+  } else {
+    ctx->num_async_read++;
+    ctx->pending_async_reads.push_back({
+                                        {op.extent.offset, op.extent.length, op.flags},
+                                        {&osd_op.outdata, 
+                                            new FillInVerifyExtentV2(&op.extent.length, &osd_op.rval,
+					                        &osd_op.outdata, maybe_crc, oi.size,
+					                        osd, ctx, soid, op.flags)}});
+    dout(10) << " async_read noted for " << soid << dendl;
+    ctx->op_finishers[ctx->current_osd_subop_num].reset(
+      new ReadFinisher(osd_op));
   }
 
   // XXX the op.extent.length is the requested length for async read
@@ -5169,6 +5266,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     dout(10) << "do_osd_op  " << osd_op << dendl;
 
     bufferlist::iterator bp = osd_op.indata.begin();
+    bool sync_read = false;
 
     // user-visible modifcation?
     switch (op.op) {
@@ -5235,6 +5333,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	result = -EOPNOTSUPP;
 	break;
       }
+      sync_read = true;
       // fall through
     case CEPH_OSD_OP_READ:
       ++ctx->num_read;
@@ -5246,7 +5345,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	if (!ctx->data_off) {
 	  ctx->data_off = op.extent.offset;
 	}
-	result = do_read(ctx, osd_op);
+	result = do_read(ctx, osd_op, sync_read);
       } else {
 	result = op_finisher->execute();
       }

@@ -461,7 +461,8 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0) override;
+    uint32_t op_flags = 0,
+    Context *on_complete = nullptr) override;
   int _do_read(
     OnodeRef o,
     uint64_t offset,

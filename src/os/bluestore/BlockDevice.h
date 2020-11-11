@@ -48,9 +48,11 @@ public:
   std::atomic_int num_pending = {0};
   std::atomic_int num_running = {0};
   bool allow_eio;
+  Context *read_context;
 
-  explicit IOContext(CephContext* cct, void *p, bool allow_eio = false)
-    : cct(cct), priv(p), allow_eio(allow_eio)
+  explicit IOContext(CephContext* cct, void *p, bool allow_eio = false,
+                     Context *read_context = nullptr)
+    : cct(cct), priv(p), allow_eio(allow_eio), read_context(read_context)
     {}
 
   // no copying

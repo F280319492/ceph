@@ -1526,11 +1526,14 @@ public:
     OnodeRef o;
     uint64_t offset;
     size_t length;
+    bool buffered;
+    bufferlist *bl;
+    int r;
     ready_regions_t ready_regions;
     vector<bufferlist> compressed_blob_bls;
     blobs2read_t blobs2read;
-    bool buffered;
   };
+
   void _read_cache(
     OnodeRef o,
     uint64_t offset,
@@ -1554,6 +1557,36 @@ public:
     bool buffered,
     bool* csum_error,
     bufferlist& bl);
+  
+  class C_IOReadFinish : public Context {
+    BlueStore *store;
+  public:
+    Context *pg_ctx;
+    io_context_read_result_t read_result;
+
+  public:                                           
+    C_IOReadFinish(BlueStore *store,
+                   Context *pg_ctx,
+                   OnodeRef o,
+                   uint64_t offset,
+                   size_t length,
+                   bool buffered,
+                   bufferlist *bl)
+        : store(store), pg_ctx(pg_ctx) {
+            read_result.o = o;
+            read_result.offset = offset;
+            read_result.length = length;
+            read_result.buffered = buffered;
+            read_result.r = 0;
+            read_result.bl = bl;
+        }
+    void finish(int r) override {
+      //TODO
+      read_result.r = r;
+      store->enqueue_read_async(this);
+    }
+  };
+
   struct TransContext : public AioContext {
     MEMPOOL_CLASS_HELPERS();
 
@@ -1855,6 +1888,15 @@ public:
       boost::intrusive::list_member_hook<>,
       &OpSequencer::deferred_osr_queue_item> > deferred_osr_queue_t;
 
+  struct ReadAsyncThread : public Thread {
+    BlueStore *store;
+    explicit ReadAsyncThread(BlueStore *s) : store(s) {}
+    void *entry() override {
+      store->_read_async_thread();
+      return NULL;
+    }
+  };
+
   struct KVSyncThread : public Thread {
     BlueStore *store;
     explicit KVSyncThread(BlueStore *s) : store(s) {}
@@ -1942,6 +1984,18 @@ private:
 
   int m_finisher_num = 1;
   vector<Finisher*> finishers;
+
+  deque<Context*> read_async_queue; 
+  ReadAsyncThread read_async_thread;
+  bool read_async_stop = false;
+  std::mutex read_async_lock;
+  std::condition_variable read_async_cond;
+public:
+  void enqueue_read_async(Context *ctx) {
+    read_async_queue.push_back(ctx);
+    read_async_cond.notify_one();
+  }
+private:
 
   KVSyncThread kv_sync_thread;
   std::mutex kv_lock;
@@ -2252,6 +2306,10 @@ private:
   void _osr_drain_all();
   void _osr_unregister_all();
 
+  void _read_async_start();
+  void _read_async_stop();
+  void _read_async_thread();
+  
   void _kv_start();
   void _kv_stop();
   void _kv_sync_thread();
@@ -2443,14 +2501,16 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0) override;
+    uint32_t op_flags = 0,
+    Context *on_complete = nullptr) override;
   int read(
     CollectionHandle &c,
     const ghobject_t& oid,
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0) override;
+    uint32_t op_flags = 0,
+    Context *on_complete = nullptr) override;
   int _do_read(
     Collection *c,
     OnodeRef o,
@@ -2458,7 +2518,8 @@ public:
     size_t len,
     bufferlist& bl,
     uint32_t op_flags = 0,
-    uint64_t retry_count = 0);
+    uint64_t retry_count = 0,
+    Context *on_complete = nullptr);
 
 private:
   int _fiemap(CollectionHandle &c_, const ghobject_t& oid,

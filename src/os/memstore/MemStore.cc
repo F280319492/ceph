@@ -316,7 +316,8 @@ int MemStore::read(
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags)
+    uint32_t op_flags,
+    Context *on_complete)
 {
   CollectionHandle c = get_collection(cid);
   if (!c)
@@ -330,7 +331,8 @@ int MemStore::read(
   uint64_t offset,
   size_t len,
   bufferlist& bl,
-  uint32_t op_flags)
+  uint32_t op_flags,
+  Context *on_complete)
 {
   Collection *c = static_cast<Collection*>(c_.get());
   dout(10) << __func__ << " " << c->cid << " " << oid << " "

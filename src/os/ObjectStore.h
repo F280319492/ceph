@@ -1729,15 +1729,17 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
-    uint32_t op_flags = 0) = 0;
+    uint32_t op_flags = 0,
+    Context *on_complete = nullptr) = 0;
    virtual int read(
      CollectionHandle &c,
      const ghobject_t& oid,
      uint64_t offset,
      size_t len,
      bufferlist& bl,
-     uint32_t op_flags = 0) {
-     return read(c->get_cid(), oid, offset, len, bl, op_flags);
+     uint32_t op_flags = 0,
+     Context *on_complete = nullptr) {
+     return read(c->get_cid(), oid, offset, len, bl, op_flags, on_complete);
    }
 
   /**

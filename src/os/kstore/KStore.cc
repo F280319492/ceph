@@ -1169,7 +1169,8 @@ int KStore::read(
   uint64_t offset,
   size_t length,
   bufferlist& bl,
-  uint32_t op_flags)
+  uint32_t op_flags,
+  Context *on_complete)
 {
   dout(15) << __func__ << " " << cid << " " << oid
 	   << " " << offset << "~" << length

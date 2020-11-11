@@ -70,6 +70,9 @@ class Context {
     finish(r);
     delete this;
   }
+  virtual void complete_without_del(int r) {
+    finish(r);
+  }
 };
 
 /**

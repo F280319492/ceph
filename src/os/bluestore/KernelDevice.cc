@@ -409,7 +409,10 @@ void KernelDevice::_aio_thread()
 	  if (--ioc->num_running == 0) {
 	    aio_callback(aio_callback_priv, ioc->priv);
 	  }
-	} else {
+    } else if (ioc->read_context) {   
+      static_cast<Context*>(ioc->read_context)->complete_without_del(ioc->get_return_value());
+      delete ioc;
+    } else {
           ioc->try_aio_wake();
 	}
       }
