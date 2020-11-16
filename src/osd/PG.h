@@ -296,9 +296,18 @@ protected:
 
 public:
   OSDMapRef get_osdmap() const {
-    assert(is_locked());
+    //assert(is_locked());
+    bool pg_is_locked = is_locked();
+    if(!pg_is_locked) {
+      lock();
+    }
     assert(osdmap_ref);
-    return osdmap_ref;
+    OSDMapRef r = osdmap_ref;
+    if(!pg_is_locked) {
+      unlock();
+    }
+    return r;
+    //return osdmap_ref;
   }
 protected:
 

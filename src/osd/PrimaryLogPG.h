@@ -1204,7 +1204,19 @@ protected:
     );
 
   int prepare_transaction(OpContext *ctx);
-  list<pair<OpRequestRef, OpContext*> > in_progress_async_reads;
+  //list<pair<OpRequestRef, OpContext*> > in_progress_async_reads;
+  std::mutex in_progress_async_reads_lock;
+  unordered_map<OpContext*, OpRequestRef> in_progress_async_reads;
+public:
+  void async_reads_insert(OpContext *ctx, OpRequestRef op) {
+    std::lock_guard<std::mutex> l(in_progress_async_reads_lock);
+    in_progress_async_reads.emplace(ctx, op);
+  }
+  int async_reads_erase(OpContext *ctx) {
+    std::lock_guard<std::mutex> l(in_progress_async_reads_lock);
+    return in_progress_async_reads.erase(ctx);
+  }
+protected:
   void complete_read_ctx(int result, OpContext *ctx);
   
   // pg on-disk content

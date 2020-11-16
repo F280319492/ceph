@@ -1992,6 +1992,7 @@ private:
   std::condition_variable read_async_cond;
 public:
   void enqueue_read_async(Context *ctx) {
+    std::lock_guard<std::mutex> l(read_async_lock);
     read_async_queue.push_back(ctx);
     read_async_cond.notify_one();
   }

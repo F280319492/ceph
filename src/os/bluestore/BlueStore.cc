@@ -6914,7 +6914,7 @@ int BlueStore::read(
   CollectionHandle c = _get_collection(cid);
   if (!c)
     return -ENOENT;
-  return read(c, oid, offset, length, bl, op_flags);
+  return read(c, oid, offset, length, bl, op_flags, on_complete);
 }
 
 int BlueStore::read(
@@ -6931,7 +6931,7 @@ int BlueStore::read(
   const coll_t &cid = c->get_cid();
   dout(15) << __func__ << " " << cid << " " << oid
 	   << " 0x" << std::hex << offset << "~" << length << std::dec
-	   << dendl;
+	   << " async:" << (on_complete==nullptr)  << dendl;
   if (!c->exists)
     return -ENOENT;
 
@@ -6950,8 +6950,8 @@ int BlueStore::read(
     if (offset == length && offset == 0)
       length = o->onode.size;
 
-    r = _do_read(c, o, offset, length, bl, op_flags);
-    if(on_complete) {
+    r = _do_read(c, o, offset, length, bl, op_flags, 0, on_complete);
+    if(on_complete && r == INT_MAX) {
       return r;
     }
     if (r == -EIO) {
@@ -7234,7 +7234,7 @@ int BlueStore::_do_read(
 
   dout(20) << __func__ << " 0x" << std::hex << offset << "~" << length
            << " size 0x" << o->onode.size << " (" << std::dec
-           << o->onode.size << ")" << dendl;
+           << o->onode.size << ") async:" << (on_complete==nullptr) << dendl;
   bl.clear();
 
   if (offset >= o->onode.size) {
@@ -7282,29 +7282,42 @@ int BlueStore::_do_read(
                                     // measure the whole block below.
                                     // The error isn't that much...
   //vector<bufferlist> compressed_blob_bls;
-  IOContext *ioc = new IOContext(cct, NULL, true, read_ctx); // allow EIO
+  IOContext *ioc;
+  if(on_complete) {
+    ioc = new IOContext(cct, NULL, true, read_ctx); // allow EIO
+  } else {
+    ioc = new IOContext(cct, NULL, true); // allow EIO
+  }
   r = _prepare_read_ioc(read_ctx->read_result.blobs2read, 
                         &(read_ctx->read_result.compressed_blob_bls), ioc);
   // we always issue aio for reading, so errors other than EIO are not allowed
-  if (r < 0)
+  dout(20) << __func__ << " _prepare_read_ioc finish: " << r << " " << ioc->has_pending_aios() << dendl;
+  if (r < 0) {
+    delete ioc;
+    delete read_ctx;
     return r;
+  }
 
   if (ioc->has_pending_aios()) {
     bdev->aio_submit(ioc);
     if(on_complete) {
-      return r;
+      dout(20) << __func__ << " async read return!" << dendl;
+      return INT_MAX;
     }
     dout(20) << __func__ << " waiting for aio" << dendl;
     ioc->aio_wait();
     r = ioc->get_return_value();
     if (r < 0) {
       assert(r == -EIO); // no other errors allowed
+      delete ioc;
+      delete read_ctx;
       return -EIO;
     }
   }
   logger->tinc(l_bluestore_read_wait_aio_lat, ceph_clock_now() - start);
 
   bool csum_error = false;
+  dout(20) << __func__ << " _generate_read_result_bl begin " << dendl;
   r = _generate_read_result_bl(read_ctx->read_result.o,
                                read_ctx->read_result.offset,
                                read_ctx->read_result.length, 
@@ -7312,6 +7325,7 @@ int BlueStore::_do_read(
                                read_ctx->read_result.compressed_blob_bls,
                                read_ctx->read_result.blobs2read,
                                read_ctx->read_result.buffered, &csum_error, bl);
+  dout(20) << __func__ << " _generate_read_result_bl end " << csum_error << dendl;
   if (csum_error) {
     // Handles spurious read errors caused by a kernel bug.
     // We sometimes get all-zero pages as a result of the read under
@@ -7319,6 +7333,8 @@ int BlueStore::_do_read(
     // cases.
     // See also: http://tracker.ceph.com/issues/22464
     if (retry_count >= cct->_conf->bluestore_retry_disk_reads) {
+      delete ioc;
+      delete read_ctx;
       return -EIO;
     }
     return _do_read(c, o, offset, length, bl, op_flags, retry_count + 1);
@@ -7330,6 +7346,8 @@ int BlueStore::_do_read(
     dout(5) << __func__ << " read at 0x" << std::hex << offset << "~" << length
             << " failed " << std::dec << retry_count << " times before succeeding" << dendl;
   }
+  delete ioc;
+  delete read_ctx;
   return r;
 }
 
@@ -8942,13 +8960,19 @@ void BlueStore::_read_async_thread()
       dout(20) << __func__ << " wake" << dendl;
     }
     deque<Context*> read_finish;
+    dout(10) << __func__ << " deal begin" << dendl;
     read_finish.swap(read_async_queue);
     for (auto ctx : read_finish) {
+      dout(10) << __func__ << " deal" << dendl;
       C_IOReadFinish *read_ctx = dynamic_cast<C_IOReadFinish*>(ctx);
+      dout(10) << __func__ << " dynamic_cast end:" << dendl;
+      dout(10) << __func__ << " read_ctx is null:" << (read_ctx==nullptr) << dendl;
       if(read_ctx->read_result.r < 0) {
+        dout(10) << __func__ << " read r=" << read_ctx->read_result.r << dendl;
         ceph_assert(read_ctx->read_result.r == -EIO); // no other errors allowed
         read_ctx->pg_ctx->complete(read_ctx->read_result.r);
       } else {
+        dout(10) << __func__ << " _generate_read_result_bl begin" << dendl;
         bool csum_error = false;
         _generate_read_result_bl(read_ctx->read_result.o,
                          read_ctx->read_result.offset,
@@ -8958,6 +8982,7 @@ void BlueStore::_read_async_thread()
                          read_ctx->read_result.blobs2read,
                          read_ctx->read_result.buffered, &csum_error, 
                          *read_ctx->read_result.bl);
+        dout(10) << __func__ << " _generate_read_result_bl end" << dendl;
         if (csum_error) {
           // Handles spurious read errors caused by a kernel bug.
           // We sometimes get all-zero pages as a result of the read under
@@ -8980,7 +9005,7 @@ void BlueStore::_read_async_thread()
 void BlueStore::_read_async_start()
 {
   dout(10) << __func__ << dendl;
-  read_async_thread.create("bstore_read_async");
+  read_async_thread.create("bstore_rd_ayc");
 }
 
 void BlueStore::_read_async_stop()

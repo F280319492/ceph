@@ -310,11 +310,11 @@ void ReplicatedBackend::objects_read_async(
     int _r = store->read(ch, ghobject_t(hoid), i->first.get<0>(),
 			 i->first.get<1>(), *(i->second.first),
 			 i->first.get<2>(), i->second.second);
-    //if (i->second.second) {
-    //  get_parent()->schedule_recovery_work(
-	//get_parent()->bless_gencontext(
-	//  new AsyncReadCallback(_r, i->second.second)));
-    //}
+    if (_r != INT_MAX && i->second.second) { //INT_MAX means blustore async read
+      get_parent()->schedule_recovery_work(
+	    get_parent()->bless_gencontext(
+	      new AsyncReadCallback(_r, i->second.second)));
+    }
     //if (_r < 0)
     //  r = _r;
   }

@@ -250,7 +250,8 @@ class PrimaryLogPG::C_OSD_AppliedRecoveredObjectReplica : public Context {
 // OpContext
 void PrimaryLogPG::OpContext::start_async_reads(PrimaryLogPG *pg)
 {
-  inflightreads = 1;
+  //inflightreads = 1;
+  inflightreads++;
   list<pair<boost::tuple<uint64_t, uint64_t, unsigned>,
 	    pair<bufferlist*, Context*> > > in;
   in.swap(pending_async_reads);
@@ -264,15 +265,17 @@ void PrimaryLogPG::OpContext::finish_read(PrimaryLogPG *pg)
 {
   assert(inflightreads > 0);
   --inflightreads;
-  if (async_reads_complete()) {
-    assert(pg->in_progress_async_reads.size());
-    assert(pg->in_progress_async_reads.front().second == this);
-    pg->in_progress_async_reads.pop_front();
+  //if (async_reads_complete()) {
+  //  assert(pg->in_progress_async_reads.size());
+  //  assert(pg->in_progress_async_reads.front().second == this);
+  //  pg->in_progress_async_reads.pop_front();
 
-    // Restart the op context now that all reads have been
-    // completed. Read failures will be handled by the op finisher
-    pg->execute_ctx(this);
-  }
+  //  // Restart the op context now that all reads have been
+  //  // completed. Read failures will be handled by the op finisher
+  //  pg->execute_ctx(this);
+  //}
+  assert((pg->async_reads_erase(this)));
+  pg->execute_ctx(this);
 }
 
 class CopyFromCallback : public PrimaryLogPG::CopyCallback {
@@ -3327,7 +3330,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
   if (result == -EINPROGRESS || pending_async_reads) {
     // come back later.
     if (pending_async_reads) {
-      in_progress_async_reads.push_back(make_pair(op, ctx));
+      //in_progress_async_reads.push_back(make_pair(op, ctx));
+      async_reads_insert(ctx, op);
       ctx->start_async_reads(this);
     }
     return;
@@ -4505,8 +4509,9 @@ struct FillInVerifyExtentV2 : public Context {
     if(op_ctx->num_async_read == 0) {
       if(op_ctx->async_read_on_complete) {
         op_ctx->pg->schedule_recovery_work(
-            op_ctx->pg->bless_gencontext(
-                new AsyncReadCallback(op_ctx->async_read_rval, op_ctx->async_read_on_complete)));
+            new AsyncReadCallback(op_ctx->async_read_rval, op_ctx->async_read_on_complete));
+            //op_ctx->pg->bless_gencontext(
+            //    new AsyncReadCallback(op_ctx->async_read_rval, op_ctx->async_read_on_complete)));
       } else {
         osd->clog->error() << "op_ctx->num_async_read is null!";
       }
@@ -7934,7 +7939,7 @@ void PrimaryLogPG::apply_stats(
 void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
 {
   const MOSDOp *m = static_cast<const MOSDOp*>(ctx->op->get_req());
-  assert(ctx->async_reads_complete());
+  //assert(ctx->async_reads_complete());
 
   for (vector<OSDOp>::iterator p = ctx->ops->begin();
     p != ctx->ops->end() && result >= 0; ++p) {
@@ -11282,13 +11287,21 @@ void PrimaryLogPG::on_removal(ObjectStore::Transaction *t)
 void PrimaryLogPG::clear_async_reads()
 {
   dout(10) << __func__ << dendl;
-  for(auto& i : in_progress_async_reads) {
-    dout(10) << "clear ctx: "
-             << "OpRequestRef " << i.first
-             << " OpContext " << i.second
-             << dendl;
-    close_op_ctx(i.second);
+  for (unordered_map<OpContext*, OpRequestRef>::iterator i =
+       in_progress_async_reads.begin();
+       i != in_progress_async_reads.end();
+       in_progress_async_reads.erase(i++)) {
+    close_op_ctx(i->first);
   }
+
+  //for(auto& i : in_progress_async_reads) {
+  //  dout(10) << "clear ctx: "
+  //           << "OpRequestRef " << i.second
+  //           << " OpContext " << i.first
+  //           << dendl;
+  //  close_op_ctx(i.first);
+  //  in_progress_async_reads.erase(i);
+  //}
 }
 
 void PrimaryLogPG::on_shutdown()
@@ -11473,13 +11486,13 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction *t)
   }
   objects_blocked_on_cache_full.clear();
 
-  for (list<pair<OpRequestRef, OpContext*> >::iterator i =
+  for (unordered_map<OpContext*, OpRequestRef>::iterator i =
          in_progress_async_reads.begin();
        i != in_progress_async_reads.end();
        in_progress_async_reads.erase(i++)) {
-    close_op_ctx(i->second);
+    close_op_ctx(i->first);
     if (is_primary())
-      requeue_op(i->first);
+      requeue_op(i->second);
   }
 
   // this will requeue ops we were working on but didn't finish, and
