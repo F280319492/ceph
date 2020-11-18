@@ -339,7 +339,7 @@ int RocksDBStore::do_open(ostream &out, bool create_if_missing)
   if (bloom_bits > 0) {
     dout(10) << __func__ << " set bloom filter bits per key to "
 	     << bloom_bits << dendl;
-    bbt_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(bloom_bits));
+    bbt_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(bloom_bits, false));
   }
   if (g_conf->get_val<std::string>("rocksdb_index_type") == "binary_search")
     bbt_opts.index_type = rocksdb::BlockBasedTableOptions::IndexType::kBinarySearch;
