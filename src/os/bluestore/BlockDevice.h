@@ -37,6 +37,7 @@ private:
 public:
   CephContext* cct;
   void *priv;
+  //void *bak;
 #ifdef HAVE_SPDK
   void *nvme_task_first = nullptr;
   void *nvme_task_last = nullptr;
@@ -48,16 +49,25 @@ public:
   std::atomic_int num_pending = {0};
   std::atomic_int num_running = {0};
   bool allow_eio;
+  //uint64_t padding;
   Context *read_context;
-
+  //uint64_t padding;
   explicit IOContext(CephContext* cct, void *p, bool allow_eio = false,
                      Context *read_context = nullptr)
     : cct(cct), priv(p), allow_eio(allow_eio), read_context(read_context)
-    {}
+    {
+      //padding = 0;
+      //mprotect(&read_context, 4*1024, PROT_READ);
+    }
 
   // no copying
   IOContext(const IOContext& other) = delete;
   IOContext &operator=(const IOContext& other) = delete;
+
+  ~IOContext() {
+    //mprotect(&read_context, 4*1024, PROT_READ|PROT_WRITE);
+    read_context = nullptr;
+  }
 
   bool has_pending_aios() {
     return num_pending.load();

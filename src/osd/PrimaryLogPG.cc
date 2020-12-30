@@ -1908,6 +1908,254 @@ hobject_t PrimaryLogPG::earliest_backfill() const
   return e;
 }
 
+struct PrimaryLogPG::C_PG_ObjCtx_OnFinish : Context {
+  PrimaryLogPG* pg;
+  OpRequestRef op;
+  bufferlist bv;
+  //string attr;
+  hobject_t missing_oid;
+  bool is_async_read;
+
+  C_PG_ObjCtx_OnFinish(PrimaryLogPG* pg_, OpRequestRef& op_) :
+      pg(pg_), op(op_) {
+    thread_shard = pg_->info.pgid.pgid.ps();
+    is_async_read = false;
+    bv.clear();
+  }
+  void finish(int ret) override {
+    op->mark_ind_object_context_end();
+    MOSDOp *m = static_cast<MOSDOp *>(op->get_nonconst_req());
+    const hobject_t &oid = m->get_hobj();
+    bool can_create = op->may_write() || op->may_cache();
+
+    int r = ret;
+    //PrimaryLogPG::get_object_context
+    ObjectContextRef obc = pg->get_object_context_callback(oid, can_create, ret, bv);
+    
+    if(!obc) {
+      missing_oid = oid;
+      r = -ENOENT;
+    }
+
+    pg->do_op_with_obj_ctx(op, obc, r, missing_oid);
+
+  }
+};
+
+void PrimaryLogPG::do_op_with_obj_ctx(OpRequestRef& op, ObjectContextRef& obc, 
+                                      int r, hobject_t& missing_oid)
+{
+  op->mark_ind_object_context_end();
+  MOSDOp *m = static_cast<MOSDOp *>(op->get_nonconst_req());
+  // order this op as a write?
+  bool write_ordered = op->rwordered();
+  
+  const hobject_t &oid = m->get_hobj();
+  
+
+  if (r == -EAGAIN) {
+    // If we're not the primary of this OSD, we just return -EAGAIN. Otherwise,
+    // we have to wait for the object.
+    if (is_primary()) {
+      // missing the specific snap we need; requeue and wait.
+      assert(!op->may_write()); // only happens on a read/cache
+      wait_for_unreadable_object(missing_oid, op);
+      return;
+    }
+  }
+  else if (r == 0) {
+    if (is_unreadable_object(obc->obs.oi.soid)) {
+      dout(10) << __func__ << ": clone " << obc->obs.oi.soid
+               << " is unreadable, waiting" << dendl;
+      wait_for_unreadable_object(obc->obs.oi.soid, op);
+      return;
+    }
+
+    // degraded object?  (the check above was for head; this could be a clone)
+    if (write_ordered &&
+        obc->obs.oi.soid.snap != CEPH_NOSNAP &&
+        is_degraded_or_backfilling_object(obc->obs.oi.soid)) {
+      dout(10) << __func__ << ": clone " << obc->obs.oi.soid
+               << " is degraded, waiting" << dendl;
+      wait_for_degraded_object(obc->obs.oi.soid, op);
+      return;
+    }
+  }
+
+  bool in_hit_set = false;
+  if (hit_set) {
+    if (obc.get()) {
+      if (obc->obs.oi.soid != hobject_t() && hit_set->contains(obc->obs.oi.soid))
+        in_hit_set = true;
+    } else {
+      if (missing_oid != hobject_t() && hit_set->contains(missing_oid))
+        in_hit_set = true;
+    }
+    if (!op->hitset_inserted) {
+      hit_set->insert(oid);
+      op->hitset_inserted = true;
+      if (hit_set->is_full() ||
+          hit_set_start_stamp + pool.info.hit_set_period <= m->get_recv_stamp()) {
+        hit_set_persist();
+      }
+    }
+  }
+
+  if (agent_state) {
+    if (agent_choose_mode(false, op))
+      return;
+  }
+
+  if (obc.get() && obc->obs.exists && obc->obs.oi.has_manifest()) {
+    if (maybe_handle_manifest(op, write_ordered, obc))
+      return;
+  }
+
+  if (maybe_handle_cache(op, write_ordered, obc, r, missing_oid, false, in_hit_set))
+    return;
+
+  if (r && (r != -ENOENT || !obc)) {
+    // copy the reqids for copy get on ENOENT
+    if (r == -ENOENT && (m->ops[0].op.op == CEPH_OSD_OP_COPY_GET)) {
+      fill_in_copy_get_noent(op, oid, m->ops[0]);
+      return;
+    }
+    dout(20) << __func__ << ": find_object_context got error " << r << dendl;
+    if (op->may_write() &&
+        get_osdmap()->require_osd_release >= CEPH_RELEASE_KRAKEN) {
+      record_write_error(op, oid, nullptr, r);
+    } else {
+      osd->reply_op_error(op, r);
+    }
+    return;
+  }
+
+  // make sure locator is consistent
+  object_locator_t oloc(obc->obs.oi.soid);
+  if (m->get_object_locator() != oloc) {
+    dout(10) << " provided locator " << m->get_object_locator()
+             << " != object's " << obc->obs.oi.soid << dendl;
+    osd->clog->warn() << "bad locator " << m->get_object_locator()
+                      << " on object " << oloc
+                      << " op " << *m;
+  }
+
+  // io blocked on obc?
+  if (obc->is_blocked() && !m->has_flag(CEPH_OSD_FLAG_FLUSH)) {
+    wait_for_blocked_object(obc->obs.oi.soid, op);
+    return;
+  }
+
+  dout(25) << __func__ << " oi " << obc->obs.oi << dendl;
+
+  for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
+    OSDOp &osd_op = *p;
+
+    // make sure LIST_SNAPS is on CEPH_SNAPDIR and nothing else
+    if (osd_op.op.op == CEPH_OSD_OP_LIST_SNAPS &&
+        m->get_snapid() != CEPH_SNAPDIR) {
+      dout(10) << "LIST_SNAPS with incorrect context" << dendl;
+      osd->reply_op_error(op, -EINVAL);
+      return;
+    }
+  }
+
+  OpContext *ctx = new OpContext(op, m->get_reqid(), &m->ops, obc, this);
+
+  if (!obc->obs.exists)
+    ctx->snapset_obc = get_object_context(obc->obs.oi.soid.get_snapdir(), false);
+
+  /* Due to obc caching, we might have a cached non-existent snapset_obc
+   * for the snapdir.  If so, we can ignore it.  Subsequent parts of the
+   * do_op pipeline make decisions based on whether snapset_obc is
+   * populated.
+   */
+  if (ctx->snapset_obc && !ctx->snapset_obc->obs.exists)
+    ctx->snapset_obc = ObjectContextRef();
+
+  if (m->has_flag(CEPH_OSD_FLAG_SKIPRWLOCKS)) {
+    dout(20) << __func__ << ": skipping rw locks" << dendl;
+  } else if (m->get_flags() & CEPH_OSD_FLAG_FLUSH) {
+    dout(20) << __func__ << ": part of flush, will ignore write lock" << dendl;
+
+    // verify there is in fact a flush in progress
+    // FIXME: we could make this a stronger test.
+    map<hobject_t, FlushOpRef>::iterator p = flush_ops.find(obc->obs.oi.soid);
+    if (p == flush_ops.end()) {
+      dout(10) << __func__ << " no flush in progress, aborting" << dendl;
+      reply_ctx(ctx, -EINVAL);
+      return;
+    }
+  } else if (!get_rw_locks(write_ordered, ctx)) {
+    dout(20) << __func__ << " waiting for rw locks " << dendl;
+    op->mark_delayed("waiting for rw locks");
+    close_op_ctx(ctx);
+    return;
+  }
+  dout(20) << __func__ << " obc " << *obc << dendl;
+
+  if (r) {
+    dout(20) << __func__ << " returned an error: " << r << dendl;
+    close_op_ctx(ctx);
+    if (op->may_write() &&
+        get_osdmap()->require_osd_release >= CEPH_RELEASE_KRAKEN) {
+      record_write_error(op, oid, nullptr, r);
+    } else {
+      osd->reply_op_error(op, r);
+    }
+    return;
+  }
+
+  if (m->has_flag(CEPH_OSD_FLAG_IGNORE_CACHE)) {
+    ctx->ignore_cache = true;
+  }
+
+  if ((op->may_read()) && (obc->obs.oi.is_lost()))
+  {
+    // This object is lost. Reading from it returns an error.
+    dout(20) << __func__ << ": object " << obc->obs.oi.soid
+             << " is lost" << dendl;
+    reply_ctx(ctx, -ENFILE);
+    return;
+  }
+  if (!op->may_write() &&
+      !op->may_cache() &&
+      (!obc->obs.exists ||
+       ((m->get_snapid() != CEPH_SNAPDIR) &&
+        obc->obs.oi.is_whiteout()))) {
+    // copy the reqids for copy get on ENOENT
+    if (m->ops[0].op.op == CEPH_OSD_OP_COPY_GET) {
+      fill_in_copy_get_noent(op, oid, m->ops[0]);
+      close_op_ctx(ctx);
+      return;
+    }
+    reply_ctx(ctx, -ENOENT);
+    return;
+  }
+
+  op->mark_started();
+
+  execute_ctx(ctx);
+  utime_t prepare_latency = ceph_clock_now();
+  prepare_latency -= op->get_dequeued_time();
+  osd->logger->tinc(l_osd_op_prepare_lat, prepare_latency);
+  if (op->may_read() && op->may_write())
+  {
+    osd->logger->tinc(l_osd_op_rw_prepare_lat, prepare_latency);
+  }
+  else if (op->may_read())
+  {
+    osd->logger->tinc(l_osd_op_r_prepare_lat, prepare_latency);
+  }
+  else if (op->may_write() || op->may_cache())
+  {
+    osd->logger->tinc(l_osd_op_w_prepare_lat, prepare_latency);
+  }
+
+  // force recovery of the oldest missing object if too many logs
+  maybe_force_recovery();
+}
+
 /** do_op - do an op
  * pg lock will be held (if multithreaded)
  * osd_lock NOT held.
@@ -2208,11 +2456,33 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
 
-  int r = find_object_context(
-    oid, &obc, can_create,
-    m->has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE),
-    &missing_oid);
+  int r;
+  op->mark_ind_object_context_begin();
+  //if(0) {
+  if(!can_create) {
+    //dout(0) << __func__ << " async start" << dendl;
+    C_PG_ObjCtx_OnFinish* pg_obj_ctx = new C_PG_ObjCtx_OnFinish(this, op);
+    r = find_object_context(
+      oid, &obc, can_create,
+      m->has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE),
+      &missing_oid, pg_obj_ctx);
+    //dout(0) << __func__ << " async end:" << pg_obj_ctx->is_async_read << " " << r<< dendl;
+    if(pg_obj_ctx->is_async_read) {
+      op->mark_ind_object_context_async();
+      return;
+    } else {
+      assert(pg_obj_ctx);
+      delete pg_obj_ctx;
+      pg_obj_ctx = nullptr;
+    }
+  } else {
+     r = find_object_context(
+       oid, &obc, can_create,
+       m->has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE),
+       &missing_oid);
+  }
 
+  op->mark_ind_object_context_end();
   if (r == -EAGAIN) {
     // If we're not the primary of this OSD, we just return -EAGAIN. Otherwise,
     // we have to wait for the object.
@@ -4484,6 +4754,7 @@ struct FillInVerifyExtentV2 : public Context {
     *r = len;
     if (len < 0) {
       *rval = len;
+      std::cout << " len < 0 ........" << std::endl;
       //return;
     } else {
       *rval = 0;
@@ -10083,10 +10354,97 @@ ObjectContextRef PrimaryLogPG::create_object_context(const object_info_t& oi,
   return obc;
 }
 
+ObjectContextRef PrimaryLogPG::get_object_context_callback(
+  const hobject_t& soid,                              
+  bool can_create, int r, bufferlist& bv) {
+  if (r < 0) {
+    if (!can_create) {
+      dout(10) << __func__ << ": no obc for soid "
+               << soid << " and !can_create"
+               << dendl;
+      return ObjectContextRef(); // -ENOENT!
+    }
+
+    dout(10) << __func__ << ": no obc for soid "
+             << soid << " but can_create"
+             << dendl;
+    // new object.
+    object_info_t oi(soid);
+    SnapSetContext *ssc = get_snapset_context(
+            soid, true, 0, false);
+    assert(ssc);
+    ObjectContextRef obc = create_object_context(oi, ssc);
+    obc->is_complete = true;
+    {
+      obc->create_lock.Lock();
+      obc->create_cond.Signal();
+      obc->create_lock.Unlock();
+    }
+
+    dout(10) << __func__ << ": " << obc << " " << soid
+             << " " << obc->rwstate
+             << " oi: " << obc->obs.oi
+             << " ssc: " << obc->ssc
+             << " snapset: " << obc->ssc->snapset << dendl;
+    return obc;
+  }
+
+  object_info_t oi;
+  try {
+    bufferlist::iterator bliter = bv.begin();
+    ::decode(oi, bliter);
+  } catch (...) {
+    dout(0) << __func__ << ": obc corrupt: " << soid << dendl;
+    return ObjectContextRef(); // -ENOENT!
+  }
+
+  assert(oi.soid.pool == (int64_t)info.pgid.pool());
+
+  ObjectContextRef obc = object_contexts.lookup_or_create(oi.soid);
+  obc->destructor_callback = new C_PG_ObjectContext(this, obc.get());
+  obc->obs.oi = oi;
+  obc->obs.exists = true;
+
+  obc->ssc = get_snapset_context(
+        soid, true, 0);
+
+  {
+    obc->create_lock.Lock();
+    obc->create_cond.Signal();
+    obc->create_lock.Unlock();
+  }
+  obc->is_complete = true;
+  if (is_active())
+    populate_obc_watchers(obc);
+
+  if (pool.info.require_rollback()) {
+    int r = pgbackend->objects_get_attrs(soid, &obc->attr_cache);
+    assert(r == 0);
+  }
+
+  dout(10) << __func__ << ": creating obc from disk: " << obc
+           << dendl;
+
+  // XXX: Caller doesn't expect this
+  if (obc->ssc == NULL) {
+    derr << __func__ << ": obc->ssc not available, not returning context" << dendl;
+    return ObjectContextRef(); // -ENOENT!
+  }
+
+  dout(10) << __func__ << ": " << obc << " " << soid
+           << " " << obc->rwstate
+           << " oi: " << obc->obs.oi
+           << " exists: " << (int)obc->obs.exists
+           << " ssc: " << obc->ssc
+           << " snapset: " << obc->ssc->snapset << dendl;
+  return obc;
+} 
+
 ObjectContextRef PrimaryLogPG::get_object_context(
   const hobject_t& soid,
   bool can_create,
-  const map<string, bufferlist> *attrs)
+  const map<string, bufferlist> *attrs,
+  Context* ctx)
 {
   assert(
     attrs || !pg_log.get_missing().is_missing(soid) ||
@@ -10094,13 +10452,16 @@ ObjectContextRef PrimaryLogPG::get_object_context(
     (pg_log.get_log().objects.count(soid) &&
       pg_log.get_log().objects.find(soid)->second->op ==
       pg_log_entry_t::LOST_REVERT));
+  int pos = 0;
   ObjectContextRef obc = object_contexts.lookup(soid);
   osd->logger->inc(l_osd_object_ctx_cache_total);
   if (obc) {
+    pos = 1;
     osd->logger->inc(l_osd_object_ctx_cache_hit);
     dout(10) << __func__ << ": found obc in cache: " << obc
 	     << dendl;
   } else {
+    pos = 2;
     dout(10) << __func__ << ": obc NOT found in cache: " << soid << dendl;
     // check disk
     bufferlist bv;
@@ -10108,7 +10469,22 @@ ObjectContextRef PrimaryLogPG::get_object_context(
       assert(attrs->count(OI_ATTR));
       bv = attrs->find(OI_ATTR)->second;
     } else {
-      int r = pgbackend->objects_get_attr(soid, OI_ATTR, &bv);
+      int r;
+      if(ctx) {
+        C_PG_ObjCtx_OnFinish *pg_ctx = static_cast<C_PG_ObjCtx_OnFinish*>(ctx);
+        //dout(0) << __func__ << "begin C_PG_ObjCtx_OnFinish:" << pg_ctx << dendl;
+        r = pgbackend->objects_get_attr(soid, OI_ATTR, &pg_ctx->bv, ctx);
+        //dout(0) << __func__ << "end C_PG_ObjCtx_OnFinish:" << pg_ctx<< " " << r << dendl;
+        if(r == INT_MAX) {
+          pg_ctx->is_async_read = true;
+          return ObjectContextRef();
+        } else {
+          bv = pg_ctx->bv;
+          //delete pg_ctx;
+        }
+      } else {
+        r = pgbackend->objects_get_attr(soid, OI_ATTR, &bv);
+      }
       if (r < 0) {
 	if (!can_create) {
 	  dout(10) << __func__ << ": no obc for soid "
@@ -10131,7 +10507,13 @@ ObjectContextRef PrimaryLogPG::get_object_context(
 		 << " oi: " << obc->obs.oi
 		 << " ssc: " << obc->ssc
 		 << " snapset: " << obc->ssc->snapset << dendl;
-	return obc;
+	obc->is_complete = true;
+  {
+    obc->create_lock.Lock();
+    obc->create_cond.Signal();
+    obc->create_lock.Unlock();
+  }
+  return obc;
       }
     }
 
@@ -10155,6 +10537,12 @@ ObjectContextRef PrimaryLogPG::get_object_context(
       soid, true,
       soid.has_snapset() ? attrs : 0);
 
+    obc->is_complete = true;
+    {
+      obc->create_lock.Lock();
+      obc->create_cond.Signal();
+      obc->create_lock.Unlock();
+    }
     if (is_active())
       populate_obc_watchers(obc);
 
@@ -10173,9 +10561,20 @@ ObjectContextRef PrimaryLogPG::get_object_context(
 	     << dendl;
   }
 
+  if(!obc->is_complete) {
+    dout(0) << __func__ << " obc->is_complete begin " << dendl;
+    obc->create_lock.Lock();
+    while(!obc->is_complete) {
+      obc->create_cond.Wait(obc->create_lock);
+    }
+    obc->create_lock.Unlock();
+    dout(0) << __func__ << " obc->is_complete end " << dendl;
+  }
   // XXX: Caller doesn't expect this
   if (obc->ssc == NULL) {
-    derr << __func__ << ": obc->ssc not available, not returning context" << dendl;
+    derr << __func__ << " " << __LINE__<< " obc->ssc not available, not returning context, pos:" 
+      << pos << " is_complete:" << obc->is_complete << " " << (obc->ssc==NULL) << " " 
+      << obc->obs.exists << dendl;
     return ObjectContextRef();   // -ENOENT!
   }
 
@@ -10219,13 +10618,14 @@ int PrimaryLogPG::find_object_context(const hobject_t& oid,
 				      ObjectContextRef *pobc,
 				      bool can_create,
 				      bool map_snapid_to_clone,
-				      hobject_t *pmissing)
+				      hobject_t *pmissing,
+              Context* ctx)
 {
   FUNCTRACE();
   assert(oid.pool == static_cast<int64_t>(info.pgid.pool()));
   // want the head?
   if (oid.snap == CEPH_NOSNAP) {
-    ObjectContextRef obc = get_object_context(oid, can_create);
+    ObjectContextRef obc = get_object_context(oid, can_create, 0, ctx);
     if (!obc) {
       if (pmissing)
         *pmissing = oid;

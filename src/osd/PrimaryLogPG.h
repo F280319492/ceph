@@ -62,6 +62,7 @@ public:
   /*
    * state associated with a copy operation
    */
+  struct C_PG_ObjCtx_OnFinish;
   struct OpContext;
   class CopyCallback;
 
@@ -976,8 +977,14 @@ protected:
   ObjectContextRef get_object_context(
     const hobject_t& soid,
     bool can_create,
-    const map<string, bufferlist> *attrs = 0
-    );
+    const map<string, bufferlist> *attrs = 0,
+    Context *ctx = nullptr
+  );
+  ObjectContextRef get_object_context_callback(
+    const hobject_t& soid,
+    bool can_create, int r, bufferlist& bv
+  );
+
 
   void context_registry_on_change();
   void object_context_destructor_callback(ObjectContext *obc);
@@ -987,7 +994,8 @@ protected:
 			  ObjectContextRef *pobc,
 			  bool can_create,
 			  bool map_snapid_to_clone=false,
-			  hobject_t *missing_oid=NULL);
+			  hobject_t *missing_oid=NULL,
+        Context* ctx = nullptr);
 
   void add_object_context_to_pg_stat(ObjectContextRef obc, pg_stat_t *stat);
 
@@ -1418,6 +1426,8 @@ public:
     OpRequestRef& op,
     ThreadPool::TPHandle &handle) override;
   void do_op(OpRequestRef& op) override;
+  void do_op_with_obj_ctx(OpRequestRef& op, ObjectContextRef& obc,
+                          int r, hobject_t& missing_oid);
   void record_write_error(OpRequestRef op, const hobject_t &soid,
 			  MOSDOpReply *orig_reply, int r);
   void do_pg_op(OpRequestRef op);

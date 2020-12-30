@@ -1788,6 +1788,16 @@ public:
     return getattr(c->get_cid(), oid, name, value);
   }
 
+  virtual int getattr(const coll_t& cid, const ghobject_t& oid,
+                      const char *name, bufferptr& value, Context* ctx) {
+    return -ENOTSUP;
+  }
+  virtual int getattr(CollectionHandle &c, const ghobject_t& oid,
+          const char *name, bufferptr& value, Context* ctx) {
+    return -ENOTSUP;
+  }
+
+
   /**
    * getattr -- get an xattr of an object
    *

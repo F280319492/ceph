@@ -64,7 +64,7 @@ class Context {
   virtual void finish(int r) = 0;
 
  public:
-  Context() {}
+  Context() : thread_shard(0) {}
   virtual ~Context() {}       // we want a virtual destructor!!!
   virtual void complete(int r) {
     finish(r);
@@ -73,7 +73,10 @@ class Context {
   virtual void complete_without_del(int r) {
     finish(r);
   }
+  int ret;
+  uint32_t thread_shard;
 };
+typedef Context Ceph_Context;
 
 /**
  * Simple context holding a single object

@@ -427,6 +427,57 @@ int PGBackend::objects_get_attr(
   return r;
 }
 
+struct PGBackend::C_PGBackend_R_OnFinish : Context {
+  bufferptr bp;
+  PGBackend* pg_backend;
+  bufferlist *out;
+  ghobject_t oid;
+  Context *ctx;
+
+  C_PGBackend_R_OnFinish(PGBackend* pg, bufferlist *out_, const hobject_t &hoid, Context *ctx_) :
+    pg_backend(pg), out(out_),
+    oid(ghobject_t(hoid, ghobject_t::NO_GEN, pg_backend->get_parent()->whoami_shard().shard)),
+    ctx(ctx_) {
+      thread_shard = ctx_->thread_shard;
+    }
+  void finish(int r) override {
+    if (r >= 0 && out) {
+      out->clear();
+      out->push_back(std::move(bp));
+    }
+
+    ctx->complete(r);
+    ctx = nullptr;
+  }
+};
+
+int PGBackend::objects_get_attr(
+  const hobject_t &hoid,
+  const string &attr,
+  bufferlist *out,
+  Context* ctx)
+{
+  C_PGBackend_R_OnFinish* pg_ctx = new C_PGBackend_R_OnFinish(this, out, hoid, ctx);
+  //dout(0) << __func__ << " begin:" << pg_ctx << dendl;
+  int r = store->getattr(
+    ch,
+    pg_ctx->oid,
+    attr.c_str(),
+    pg_ctx->bp,
+    pg_ctx);
+  //dout(0) << __func__ << " end:" << pg_ctx << " " << r << dendl; 
+  if(r == INT_MAX) {
+    return r;
+  }
+  if (r >= 0 && out) {
+    out->clear();
+    out->push_back(std::move(pg_ctx->bp));
+  }
+  pg_ctx->ctx = nullptr;
+  delete pg_ctx;
+  return r;
+}
+
 int PGBackend::objects_get_attrs(
   const hobject_t &hoid,
   map<string, bufferlist> *out)

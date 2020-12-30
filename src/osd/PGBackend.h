@@ -64,6 +64,7 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
     * implementation holding a lock and that the callbacks are
     * called under the same locks.
     */
+   struct C_PGBackend_R_OnFinish;
    class Listener {
    public:
      /// Debugging
@@ -222,7 +223,6 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      virtual bool should_send_op(
        pg_shard_t peer,
        const hobject_t &hoid) = 0;
-
      virtual void log_operation(
        const vector<pg_log_entry_t> &logv,
        const boost::optional<pg_hit_set_history_t> &hset_history,
@@ -540,6 +540,12 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      const hobject_t &hoid,
      const string &attr,
      bufferlist *out);
+   int objects_get_attr(        
+     const hobject_t &hoid,
+     const string &attr,
+     bufferlist *out,
+     Context* ctx);
+
 
    virtual int objects_get_attrs(
      const hobject_t &hoid,

@@ -26,6 +26,7 @@ using std::string;
 #include "include/str_list.h"
 #include "include/stringify.h"
 #include "include/str_map.h"
+#include "include/Context.h"
 #include "KeyValueDB.h"
 #include "RocksDBStore.h"
 
@@ -744,6 +745,89 @@ void RocksDBStore::RocksDBTransactionImpl::merge(
     bat.Merge(nullptr, rocksdb::SliceParts(&key_slice, 1),
               prepare_sliceparts(to_set_bl, &value_slices));
   }
+}
+
+struct RocksDBStore::C_RocksDB_RW_OnFinish : rocksdb::Context {
+  RocksDBStore* db_store;
+  bufferlist *out;
+  string value, k;
+  rocksdb::PinnableSlice pinnable_val;
+  utime_t start;
+
+  Ceph_Context* ctx;
+
+  C_RocksDB_RW_OnFinish(RocksDBStore* db_store_, bufferlist *out_, 
+                        Ceph_Context* ctx_) :
+       db_store(db_store_), out(out_), ctx(ctx_), pinnable_val(&value) {
+    start = ceph_clock_now();
+  }
+  void finish(rocksdb::Status s) override {
+    if (s.ok() && pinnable_val.IsPinned()) {
+      value.assign(pinnable_val.data(), pinnable_val.size());
+    }  // else value is already assigned
+    int r = db_store->get_callback(s, out, value, start);
+
+    ctx->complete_without_del(r);
+  }
+};
+
+int RocksDBStore::get_callback(
+  rocksdb::Status& s,
+  bufferlist *out,
+  string& value,
+  utime_t& start) 
+{
+  int r = 0;
+  if (s.ok()) {
+    out->append(value);
+  } else if (s.IsNotFound()) {
+    r = -ENOENT;
+  } else {
+    ceph_abort_msg(cct, s.ToString());
+  }
+  utime_t lat = ceph_clock_now() - start;
+  logger->inc(l_rocksdb_gets);
+  logger->tinc(l_rocksdb_get_latency, lat);
+  return r;
+}
+
+int RocksDBStore::get(
+  const string& prefix,
+  const char *key,                         
+  size_t keylen,
+  bufferlist *out,
+  Context* ctx)
+{
+  assert(out && (out->length() == 0));
+  int r = 0;
+  C_RocksDB_RW_OnFinish* db_store_ctx = new C_RocksDB_RW_OnFinish(this, out, ctx);
+
+  combine_strings(prefix, key, keylen, &db_store_ctx->k);
+  rocksdb::Status s = db->Get(rocksdb::ReadOptions(), 
+                              db->DefaultColumnFamily(),
+                              rocksdb::Slice(db_store_ctx->k), 
+                              &db_store_ctx->pinnable_val,
+                              db_store_ctx);
+  
+  if(s.IsAsyncRead()) {
+    return INT_MAX;
+  } else if (s.ok() && db_store_ctx->pinnable_val.IsPinned()) {
+    db_store_ctx->value.assign(db_store_ctx->pinnable_val.data(), db_store_ctx->pinnable_val.size());
+  }
+
+  if(s.ok()) {
+    out->append(db_store_ctx->value);
+  } else if (s.IsNotFound()) {
+    r = -ENOENT;
+  } else {
+    ceph_abort_msg(cct, s.ToString());
+  }
+  utime_t lat = ceph_clock_now() - db_store_ctx->start;
+  logger->inc(l_rocksdb_gets);
+  logger->tinc(l_rocksdb_get_latency, lat);
+  db_store_ctx->ctx = nullptr;
+  delete db_store_ctx;
+  return r;
 }
 
 //gets will bypass RocksDB row cache, since it uses iterator

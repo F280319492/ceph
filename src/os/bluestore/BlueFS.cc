@@ -25,6 +25,91 @@ MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileReaderBuffer,
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileReader, bluefs_file_reader, bluefs);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileLock, bluefs_file_lock, bluefs);
 
+void PrintBuffer(BlueFS* bluefs, const void* pBuff, unsigned int nLen)
+{
+    if (NULL == pBuff || 0 == nLen) {
+        return;
+    }
+
+    const int nBytePerLine = 16;
+    unsigned char* p = (unsigned char*)pBuff;
+    char szHex[3*nBytePerLine+1] = {0};
+
+    ldout(bluefs->cct, 0) << "-----------------begin-------------------" << dendl;
+    for (unsigned int i=0; i<nLen; ++i) {
+        int idx = 3 * (i % nBytePerLine);
+        if (0 == idx) {
+            memset(szHex, 0, sizeof(szHex));
+        }
+        snprintf(&szHex[idx], 4, "%02x ", p[i]); // buff长度要多传入1个字节
+
+        // 以16个字节为一行，进行打印
+        if (0 == ((i+1) % nBytePerLine)) {
+          ldout(bluefs->cct, 0) << szHex << dendl;  
+        }
+    }
+
+    // 打印最后一行未满16个字节的内容
+    if (0 != (nLen % nBytePerLine)) {
+      ldout(bluefs->cct, 0) << szHex << dendl;  
+    }
+    ldout(bluefs->cct, 0) << "-----------------end-------------------" << dendl;
+}
+
+
+struct BlueFS::C_BlueFS_OnFinish : Context {
+  BlueFS* bluefs;
+  FileReader *h;
+  char *out;
+  size_t len;
+  rocksdb::Slice* result; 
+  rocksdb::Context* ctx;
+  size_t read_len;
+  int running_aios;
+  //std::vector<IOContext*> ioc_v;
+  bufferlist bl;
+  int ret;
+
+  C_BlueFS_OnFinish(BlueFS* bluefs_, FileReader *h_, char *out_,
+                    size_t len_, rocksdb::Slice* result_, rocksdb::Context* ctx_) : 
+    bluefs(bluefs_), h(h_), out(out_), len(len_), result(result_), ctx(ctx_){
+      read_len = 0;
+      running_aios = 0;
+      ret = 0;
+      bl.clear();
+    }
+  void finish(int r) override {
+    if(r < 0) {
+      ret = r;
+    }
+    //ldout(bluefs->cct, 0) << __func__ << " " << this << " " << running_aios << " " << len << dendl;
+    running_aios--;
+    if(running_aios == 0) { //all aio read return
+      //ldout(bluefs->cct, 0) << __func__ << " " << this << " " << ret<<  dendl;
+      --h->file->num_reading;
+      //PrintBuffer(bluefs, bl.c_str(), len);
+      //ldout(bluefs->cct, 0) << __func__ << " C_BlueFS_OnFinish " << bl.length() << " " << len<< dendl;
+      //memcpy(out, bl.c_str(), len);
+      //bl.copy(bl.begin().get_off(), len, out);
+      assert(bl.length() == len);
+      
+      assert(read_len == len);
+      bl.copy(0, bl.length(), out); 
+      //PrintBuffer(bluefs, out, len);
+      *result = rocksdb::Slice(out, read_len);
+      //PrintBuffer(bluefs, out, len);
+      if(ret == 0) {
+        ctx->complete_without_del(rocksdb::Status::OK());
+        //ctx->complete(rocksdb::Status::OK());
+      } else {
+        ctx->complete_without_del(rocksdb::Status::IOError());
+        //ctx->complete(rocksdb::Status::IOError());
+      }
+      //ldout(bluefs->cct, 0) << __func__ << " " << this << " complete " << ret<<  dendl;
+      delete this;
+    }
+  }
+};
 
 class BlueFS::SocketHook : public AdminSocketHook {
   BlueFS* bluefs;
@@ -999,6 +1084,75 @@ void BlueFS::_drop_link(FileRef file)
       file->dirty_seq = 0;
     }
   }
+}
+
+int BlueFS::_read_random(
+  FileReader *h,         ///< [in] read from here
+  uint64_t off,          ///< [in] offset
+  size_t len,            ///< [in] this many bytes
+  char *out,             ///< [out] optional: or copy it here  
+  rocksdb::Slice* result,
+  rocksdb::Context* ctx) 
+{
+  dout(10) << __func__ << " h " << h
+           << " 0x" << std::hex << off << "~" << len << std::dec
+	   << " from " << h->file->fnode << dendl;
+
+  ++h->file->num_reading;
+  if (!h->ignore_eof &&
+      off + len > h->file->fnode.size) {
+    if (off > h->file->fnode.size)
+      len = 0;
+    else
+      len = h->file->fnode.size - off;
+    dout(20) << __func__ << " reaching (or past) eof, len clipped to 0x"
+	     << std::hex << len << std::dec << dendl;
+  }
+
+  C_BlueFS_OnFinish* bluefs_ctx = new C_BlueFS_OnFinish(this, h, out, len, result, ctx);
+  std::vector<std::pair<BlockDevice* , IOContext*>> io_ctx_vec;
+  int ret = 0;
+  bool has_pending_read = false;
+  while (len > 0) {
+    uint64_t x_off = 0;
+    auto p = h->file->fnode.seek(off, &x_off);
+    uint64_t l = MIN(p->length - x_off, len);
+    dout(10) << __func__ << " read buffered 0x"
+             << std::hex << x_off << "~" << l << std::dec
+             << " of " << *p << dendl;
+    IOContext* ioc = new IOContext(cct, NULL, true, bluefs_ctx); // allow EIO
+    //bluefs_ctx->ioc_v.push_back(ioc);
+    int r = bdev[p->bdev]->aio_read(p->offset + x_off, l, &bluefs_ctx->bl, ioc);
+    if(ioc->has_pending_aios()) {
+      //bdev[p->bdev]->aio_submit(ioc);
+      io_ctx_vec.push_back({bdev[p->bdev], ioc});
+      has_pending_read = true;
+      bluefs_ctx->running_aios++;
+    } else {
+      delete ioc;
+    }
+    //int r = bdev[p->bdev]->read_random(p->offset + x_off, l, out,
+	  //			       cct->_conf->bluefs_buffered_io);
+    assert(r == 0);
+    off += l;
+    len -= l;
+    ret += l;
+    out += l;
+  }
+
+  dout(10) << __func__ << " got " << ret << dendl;
+  if(!has_pending_read) {
+    --h->file->num_reading;
+    delete bluefs_ctx;
+    derr << __func__ << " read nothing" << dendl;
+  } else {
+    bluefs_ctx->read_len = ret;
+    for(auto ioc : io_ctx_vec) {
+        ioc.first->aio_submit(ioc.second);
+    }
+  }
+  //dout(0) << __func__ << " " << bluefs_ctx << " " << bluefs_ctx->running_aios << ret << dendl;
+  return ret;
 }
 
 int BlueFS::_read_random(

@@ -364,32 +364,32 @@ void KernelDevice::_aio_thread()
     if (r > 0) {
       dout(30) << __func__ << " got " << r << " completed aios" << dendl;
       for (int i = 0; i < r; ++i) {
-	IOContext *ioc = static_cast<IOContext*>(aio[i]->priv);
-	_aio_log_finish(ioc, aio[i]->offset, aio[i]->length);
-	if (aio[i]->queue_item.is_linked()) {
-	  std::lock_guard<std::mutex> l(debug_queue_lock);
-	  debug_aio_unlink(*aio[i]);
-	}
+	      IOContext *ioc = static_cast<IOContext*>(aio[i]->priv);
+        _aio_log_finish(ioc, aio[i]->offset, aio[i]->length);
+	      if (aio[i]->queue_item.is_linked()) {
+	        std::lock_guard<std::mutex> l(debug_queue_lock);
+	        debug_aio_unlink(*aio[i]);
+	      }
 
-	// set flag indicating new ios have completed.  we do this *before*
-	// any completion or notifications so that any user flush() that
-	// follows the observed io completion will include this io.  Note
-	// that an earlier, racing flush() could observe and clear this
-	// flag, but that also ensures that the IO will be stable before the
-	// later flush() occurs.
-	io_since_flush.store(true);
+	      // set flag indicating new ios have completed.  we do this *before*
+	      // any completion or notifications so that any user flush() that
+	      // follows the observed io completion will include this io.  Note
+	      // that an earlier, racing flush() could observe and clear this
+	      // flag, but that also ensures that the IO will be stable before the
+	      // later flush() occurs.
+	      io_since_flush.store(true);
 
-	long r = aio[i]->get_return_value();
+	      long r = aio[i]->get_return_value();
         if (r < 0) {
           derr << __func__ << " got r=" << r << " (" << cpp_strerror(r) << ")"
-	       << dendl;
+	             << dendl;
           if (ioc->allow_eio && is_expected_ioerr(r)) {
             derr << __func__ << " translating the error to EIO for upper layer"
-		 << dendl;
+		             << dendl;
             ioc->set_return_value(-EIO);
           } else {
             assert(0 == "got unexpected error from aio_t::get_return_value. "
-			"This may suggest HW issue. Please check your dmesg!");
+			                  "This may suggest HW issue. Please check your dmesg!");
           }
         } else if (aio[i]->length != (uint64_t)r) {
           derr << "aio to " << aio[i]->offset << "~" << aio[i]->length
@@ -402,19 +402,30 @@ void KernelDevice::_aio_thread()
                  << " with " << (ioc->num_running.load() - 1)
                  << " aios left" << dendl;
 
-	// NOTE: once num_running and we either call the callback or
-	// call aio_wake we cannot touch ioc or aio[] as the caller
-	// may free it.
-	if (ioc->priv) {
-	  if (--ioc->num_running == 0) {
-	    aio_callback(aio_callback_priv, ioc->priv);
-	  }
-    } else if (ioc->read_context) {   
-      static_cast<Context*>(ioc->read_context)->complete_without_del(ioc->get_return_value());
-      delete ioc;
-    } else {
+	      // NOTE: once num_running and we either call the callback or
+	      // call aio_wake we cannot touch ioc or aio[] as the caller
+	      // may free it.
+	      if (ioc->priv) {
+	        if (--ioc->num_running == 0) {
+	          aio_callback(aio_callback_priv, ioc->priv);
+	        } 
+        } else if (ioc->read_context) {     
+          if (--ioc->num_running == 0) {
+            //assert(ioc->read_context == ioc->bak);
+            //assert((uint64_t)(ioc->read_context) % 2 == 0);
+            if((uint64_t)(ioc->read_context) % 2 == 1)
+              dout(0) << __func__ << " got " << ioc << " " << ioc->read_context << " " << aio[i]->length << dendl;
+            ioc->read_context->complete_without_del(ioc->get_return_value());
+            //dout(0) << __func__ << " finish " << ioc<<dendl;
+            if(ioc) {
+              delete ioc;
+            } else {
+               dout(10) << __func__ << " ioc is null" << dendl;
+            }
+          }
+        } else {
           ioc->try_aio_wake();
-	}
+	      }
       }
     }
     if (cct->_conf->bdev_debug_aio) {

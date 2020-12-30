@@ -3240,6 +3240,198 @@ uint64_t BlueStore::Collection::make_blob_unshared(SharedBlob *sb)
   return sbid;
 }
 
+class BlueStore::C_IOReadFinish : public Context {
+  BlueStore *store;
+public:
+  Context *pg_ctx;
+  io_context_read_result_t read_result;
+
+public:
+  C_IOReadFinish(BlueStore *store,
+                 Context *pg_ctx,
+                 OnodeRef o,
+                 uint64_t offset,
+                 size_t length,
+                 bool buffered,
+                 bufferlist *bl)
+      : store(store), pg_ctx(pg_ctx) {
+          read_result.o = o;
+          read_result.offset = offset;
+          read_result.length = length;
+          read_result.buffered = buffered;
+          read_result.r = 0;
+          read_result.bl = bl;
+      }
+  void finish(int r) override {
+    //TODO
+    //ldout(store->cct, 0) << __func__ << " C_IOReadFinish" << dendl;
+    read_result.r = r;
+    store->enqueue_read_async(this);
+  }
+};
+
+struct BlueStore::C_BS_GetAttr_OnFinish : Context {
+  BlueStore::Collection* c;
+  const ghobject_t& oid;
+  mempool::bluestore_cache_other::string k; // getattr key
+  RWLock::RLocker l;
+  bufferptr* value;  //getattr return value
+
+  mempool::bluestore_cache_other::string key; // db key
+  bufferlist v; //db return value
+  Context* ctx;
+  bool is_enqueue;
+
+  C_BS_GetAttr_OnFinish(BlueStore::Collection* c_, const ghobject_t& oid_,
+                        const char *name, 
+                        RWLock& lock, bufferptr* value_, Context* ctx_) :
+    c(c_), oid(oid_), k(name), l(lock), value(value_), ctx(ctx_), is_enqueue(false){
+      thread_shard = ctx_->thread_shard;
+      v.clear();
+    }
+  void finish(int r) override {
+    if(!is_enqueue) {
+      ret = r;
+      is_enqueue = true;
+      c->store->enqueue_read_meta(this, this->thread_shard % c->store->meta_thread_num);
+    } else {
+      //BlueStore::Collection::get_onode
+      bool create = false;
+      OnodeRef o = c->get_onode_callback(oid, key, v, create, r);
+
+      //r = c->store->getattr_callbak(o, k, value);
+      //BlueStore::getattr
+      if (!o || !o->exists) {
+        r = -ENOENT;
+      } else if (!o->onode.attrs.count(k)) {
+        r = -ENODATA;
+      } else {
+        *value = o->onode.attrs[k];
+        r = 0;
+      }
+
+      ctx->complete(r);
+    }
+  }
+};
+
+BlueStore::OnodeRef BlueStore::Collection::get_onode_callback(
+  const ghobject_t& oid,
+  mempool::bluestore_cache_other::string& key,
+  bufferlist &v,
+  bool create, int r)
+{
+  OnodeRef o;
+  Onode *on;
+  if(r < 0)
+    ldout(store->cct, 10) << __func__ << " oid:" << oid << " r:" << r << dendl; 
+  if (v.length() == 0) {
+    //ldout(store->cct, 0) << __func__ << " 1" << dendl;
+    assert(r == -ENOENT);
+    if (!store->cct->_conf->bluestore_debug_misc && !create)
+      return OnodeRef();
+
+    // new object, new onode
+    on = new Onode(this, oid, key);
+  } else {
+    // loaded
+     //ldout(store->cct, 0) << __func__ << " 2" << dendl;
+    assert(r >= 0);
+    on = new Onode(this, oid, key);
+    on->exists = true;
+    bufferptr::iterator p = v.front().begin_deep();
+    on->onode.decode(p);
+    //ldout(store->cct, 0) << __func__ << " 3" << dendl;
+    for (auto& i : on->onode.attrs) {
+      i.second.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+    }
+
+    //ldout(store->cct, 0) << __func__ << " 4" << dendl;
+    // initialize extent_map
+    on->extent_map.decode_spanning_blobs(p);
+    if (on->onode.extent_map_shards.empty()) {
+      denc(on->extent_map.inline_bl, p);
+      on->extent_map.decode_some(on->extent_map.inline_bl);
+      on->extent_map.inline_bl.reassign_to_mempool(
+	    mempool::mempool_bluestore_cache_other);
+    } else {
+      on->extent_map.init_shards(false, false);
+    }
+    //ldout(store->cct, 0) << __func__ << " 5" << dendl;
+  }
+  o.reset(on);
+  //ldout(store->cct, 0) << __func__ << " 6" << dendl;
+  return onode_map.add(oid, o);
+}
+
+ BlueStore::OnodeRef BlueStore::Collection::get_onode(
+   const ghobject_t& oid,
+   Context* ctx,
+   bool *is_async_read,
+   bool create)
+{
+  assert(create ? lock.is_wlocked() : lock.is_locked());
+
+  spg_t pgid;
+  if (cid.is_pg(&pgid)) {
+    if (!oid.match(cnode.bits, pgid.ps())) {
+      lderr(store->cct) << __func__ << " oid " << oid << " not part of "
+			<< pgid << " bits " << cnode.bits << dendl;
+      ceph_abort();
+    }
+  }
+
+  OnodeRef o = onode_map.lookup(oid);
+  if (o)
+    return o;
+
+  C_BS_GetAttr_OnFinish* bs_ctx = static_cast<BlueStore::C_BS_GetAttr_OnFinish*>(ctx);
+  get_object_key(store->cct, oid, &bs_ctx->key);
+  mempool::bluestore_cache_other::string key = bs_ctx->key;
+  ldout(store->cct, 10) << __func__ << " oid " << oid << " key "
+			<< pretty_binary_string(key) << dendl;
+
+  int r = store->db->get(PREFIX_OBJ, bs_ctx->key.c_str(), bs_ctx->key.size(), &bs_ctx->v, ctx);
+  if(r == INT_MAX) {
+    *is_async_read = true;
+    return OnodeRef();
+  }
+  //ldout(store->cct, 0) << " r " << r << " v.len " << bs_ctx->v.length() << dendl;
+  Onode *on;
+  if (bs_ctx->v.length() == 0) {
+    assert(r == -ENOENT);
+    if (!store->cct->_conf->bluestore_debug_misc && !create)
+      return OnodeRef();
+
+    // new object, new onode
+    on = new Onode(this, oid, key);
+  } else {
+    // loaded
+    assert(r >= 0);
+    on = new Onode(this, oid, key);
+    on->exists = true;
+    bufferptr::iterator p = bs_ctx->v.front().begin_deep();
+    on->onode.decode(p);
+    for (auto& i : on->onode.attrs) {
+      i.second.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+    }
+
+    // initialize extent_map
+    on->extent_map.decode_spanning_blobs(p);
+    if (on->onode.extent_map_shards.empty()) {
+      denc(on->extent_map.inline_bl, p);
+      on->extent_map.decode_some(on->extent_map.inline_bl);
+      on->extent_map.inline_bl.reassign_to_mempool(
+	mempool::mempool_bluestore_cache_other);
+    } else {
+      on->extent_map.init_shards(false, false);
+    }
+  }
+  o.reset(on);
+  return onode_map.add(oid, o);
+}
+
+
 BlueStore::OnodeRef BlueStore::Collection::get_onode(
   const ghobject_t& oid,
   bool create)
@@ -3775,11 +3967,14 @@ BlueStore::BlueStore(CephContext *cct, const string& path)
 		       cct->_conf->bluestore_throttle_bytes +
 		       cct->_conf->bluestore_throttle_deferred_bytes),
     deferred_finisher(cct, "defered_finisher", "dfin"),
-     read_async_thread(this),
+    //read_meta_thread(this, 0),
+    meta_thread_num(2),
+    read_async_thread(this),
     kv_sync_thread(this),
     kv_finalize_thread(this),
     mempool_thread(this)
 {
+  read_meta_threads = new MetaThread[meta_thread_num];
   _init_logger();
   cct->_conf->add_observer(this);
   set_cache_shards(1);
@@ -3795,13 +3990,16 @@ BlueStore::BlueStore(CephContext *cct,
 		       cct->_conf->bluestore_throttle_bytes +
 		       cct->_conf->bluestore_throttle_deferred_bytes),
     deferred_finisher(cct, "defered_finisher", "dfin"),
-     read_async_thread(this),
+    //read_meta_thread(this, 0),
+    meta_thread_num(2),
+    read_async_thread(this),
     kv_sync_thread(this),
     kv_finalize_thread(this),
     min_alloc_size(_min_alloc_size),
     min_alloc_size_order(ctz(_min_alloc_size)),
     mempool_thread(this)
 {
+  read_meta_threads = new MetaThread[meta_thread_num];
   _init_logger();
   cct->_conf->add_observer(this);
   set_cache_shards(1);
@@ -3809,6 +4007,7 @@ BlueStore::BlueStore(CephContext *cct,
 
 BlueStore::~BlueStore()
 {
+  delete []read_meta_threads;
   for (auto f : finishers) {
     delete f;
   }
@@ -5884,6 +6083,10 @@ int BlueStore::_mount(bool kv_only)
   }
 
   _kv_start();
+  for(int i = 0; i < meta_thread_num; i++) {
+    read_meta_threads[i]._read_meta_start(i); 
+  }
+  //_read_meta_start();
   _read_async_start();
 
   r = _deferred_replay();
@@ -5897,6 +6100,10 @@ int BlueStore::_mount(bool kv_only)
 
  out_stop:
   _kv_stop();
+  for(int i = 0; i < meta_thread_num; i++) {
+    read_meta_threads[i]._read_meta_stop();
+  }
+  //_read_meta_stop();
   _read_async_stop();
  out_coll:
   _flush_cache();
@@ -7299,8 +7506,10 @@ int BlueStore::_do_read(
   }
 
   if (ioc->has_pending_aios()) {
+    //dout(0) << __func__ << " " << ioc << " " << ioc->read_context << dendl;
     bdev->aio_submit(ioc);
     if(on_complete) {
+      //dout(0) << __func__ << " " << ioc << " " << ioc->read_context << " " << &(ioc->read_context) << dendl;
       dout(20) << __func__ << " async read return!" << dendl;
       return INT_MAX;
     }
@@ -7607,6 +7816,77 @@ int BlueStore::getattr(
   return r;
 }
 
+int BlueStore::getattr(
+  const coll_t& cid,
+  const ghobject_t& oid,
+  const char *name,
+  bufferptr& value,
+  Context* ctx)
+{
+  CollectionHandle c = _get_collection(cid);
+  if (!c)
+    return -ENOENT;
+  return getattr(c, oid, name, value, ctx);
+}
+
+int BlueStore::getattr_callbak(OnodeRef& o, 
+                               mempool::bluestore_cache_other::string k,
+                               bufferptr &value)
+{
+  if (!o || !o->exists) {
+    return -ENOENT;
+  }
+
+  if (!o->onode.attrs.count(k)) {
+    return -ENODATA;
+  }
+  value = o->onode.attrs[k];
+  return 0;
+}
+
+int BlueStore::getattr(
+  CollectionHandle &c_,
+  const ghobject_t& oid,
+  const char *name,
+  bufferptr& value,
+  Context* ctx)
+{
+  Collection *c = static_cast<Collection *>(c_.get());
+  dout(10) << __func__ << " " << c->cid << " " << oid << " " << name << dendl;
+  if (!c->exists)
+    return -ENOENT;
+
+  C_BS_GetAttr_OnFinish* bs_ctx = new C_BS_GetAttr_OnFinish(
+        c, oid, name, c->lock, &value, ctx);
+  int r;
+  {
+    bool is_async_read = false;
+    OnodeRef o = c->get_onode(oid, bs_ctx, &is_async_read, false);
+    if(is_async_read) {
+      return INT_MAX;
+    }
+    if (!o || !o->exists) {
+      r = -ENOENT;
+      goto out;
+    }
+
+    if (!o->onode.attrs.count(bs_ctx->k)) {
+      r = -ENODATA;
+      goto out;
+    }
+    value = o->onode.attrs[bs_ctx->k];
+    r = 0;
+  }
+ out:
+  if (r == 0 && _debug_mdata_eio(oid)) {
+    r = -EIO;
+    derr << __func__ << " " << c->cid << " " << oid << " INJECT EIO" << dendl;
+  }
+  dout(10) << __func__ << " " << c->cid << " " << oid << " " << name
+	   << " = " << r << dendl;
+  delete bs_ctx;
+  return r;
+}
 
 int BlueStore::getattrs(
   const coll_t& cid,
@@ -8960,19 +9240,14 @@ void BlueStore::_read_async_thread()
       dout(20) << __func__ << " wake" << dendl;
     }
     deque<Context*> read_finish;
-    dout(10) << __func__ << " deal begin" << dendl;
     read_finish.swap(read_async_queue);
+    l.unlock();
     for (auto ctx : read_finish) {
-      dout(10) << __func__ << " deal" << dendl;
       C_IOReadFinish *read_ctx = dynamic_cast<C_IOReadFinish*>(ctx);
-      dout(10) << __func__ << " dynamic_cast end:" << dendl;
-      dout(10) << __func__ << " read_ctx is null:" << (read_ctx==nullptr) << dendl;
       if(read_ctx->read_result.r < 0) {
-        dout(10) << __func__ << " read r=" << read_ctx->read_result.r << dendl;
         ceph_assert(read_ctx->read_result.r == -EIO); // no other errors allowed
         read_ctx->pg_ctx->complete(read_ctx->read_result.r);
       } else {
-        dout(10) << __func__ << " _generate_read_result_bl begin" << dendl;
         bool csum_error = false;
         _generate_read_result_bl(read_ctx->read_result.o,
                          read_ctx->read_result.offset,
@@ -8982,7 +9257,6 @@ void BlueStore::_read_async_thread()
                          read_ctx->read_result.blobs2read,
                          read_ctx->read_result.buffered, &csum_error, 
                          *read_ctx->read_result.bl);
-        dout(10) << __func__ << " _generate_read_result_bl end" << dendl;
         if (csum_error) {
           // Handles spurious read errors caused by a kernel bug.
           // We sometimes get all-zero pages as a result of the read under
@@ -8999,9 +9273,47 @@ void BlueStore::_read_async_thread()
       read_ctx->pg_ctx->complete(read_ctx->read_result.bl->length());
       delete read_ctx;
     }
+    l.lock();
   }
 }
 
+void BlueStore::MetaThread::_read_meta_start(uint32_t thread_id)
+{
+  //dout(10) << __func__ << dendl;
+  char tp_name[16]; 
+  sprintf(tp_name, "bstore_meta-%d",thread_id);
+  read_meta_thread.create(tp_name);
+}
+
+void BlueStore::MetaThread::_read_meta_stop()
+{
+  //dout(10) << __func__ << dendl;
+  { 
+    std::unique_lock<std::mutex> l(read_meta_lock);
+    read_meta_stop = true;
+    read_meta_cond.notify_all();
+  }
+  read_meta_thread.join();
+  read_meta_stop = false;
+}
+
+void BlueStore::MetaThread::_read_meta_thread()
+{
+  //dout(10) << __func__ << dendl;
+  std::unique_lock<std::mutex> l(read_meta_lock);
+  while(!read_meta_stop) {
+    if(read_meta_queue.empty()) {
+      read_meta_cond.wait(l);
+    }
+    deque<Context*> read_finish;
+    read_finish.swap(read_meta_queue);
+    l.unlock();
+    for (auto ctx : read_finish) {
+      ctx->complete(ctx->ret);
+    }
+    l.lock();
+  }
+}
 void BlueStore::_read_async_start()
 {
   dout(10) << __func__ << dendl;
@@ -9011,7 +9323,11 @@ void BlueStore::_read_async_start()
 void BlueStore::_read_async_stop()
 {
   dout(10) << __func__ << dendl;
-  read_async_stop = true;
+  {
+    std::unique_lock<std::mutex> l(read_async_lock);
+    read_async_stop = true;
+    read_async_cond.notify_all();
+  }
   read_async_thread.join();
   read_async_stop = false;
 }

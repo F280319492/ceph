@@ -144,6 +144,7 @@ public:
 
   typedef map<uint64_t, bufferlist> ready_regions_t;
 
+  struct C_BS_GetAttr_OnFinish;
   struct BufferSpace;
   struct Collection;
   typedef boost::intrusive_ptr<Collection> CollectionRef;
@@ -1360,7 +1361,11 @@ public:
     //pool options
     pool_opts_t pool_opts;
 
+    OnodeRef get_onode(const ghobject_t& oid, Context* ctx, bool* is_async_read, bool create);
     OnodeRef get_onode(const ghobject_t& oid, bool create);
+    OnodeRef get_onode_callback(const ghobject_t& oid,
+                                mempool::bluestore_cache_other::string& key,
+                                bufferlist &v, bool create, int r);
 
     // the terminology is confusing here, sorry!
     //
@@ -1558,6 +1563,8 @@ public:
     bool* csum_error,
     bufferlist& bl);
   
+  class C_IOReadFinish;
+  /*
   class C_IOReadFinish : public Context {
     BlueStore *store;
   public:
@@ -1582,10 +1589,12 @@ public:
         }
     void finish(int r) override {
       //TODO
+      ldout(store->cct, 0) << __func__ << " C_IOReadFinish" << dendl;
       read_result.r = r;
       store->enqueue_read_async(this);
     }
   };
+  */
 
   struct TransContext : public AioContext {
     MEMPOOL_CLASS_HELPERS();
@@ -1888,6 +1897,37 @@ public:
       boost::intrusive::list_member_hook<>,
       &OpSequencer::deferred_osr_queue_item> > deferred_osr_queue_t;
 
+  //struct ReadMetaThread;
+  struct MetaThread {
+    struct ReadMetaThread : public Thread {               
+      MetaThread *m;
+      explicit ReadMetaThread(MetaThread *m_) : m(m_) {}
+      void *entry() override {
+        m->_read_meta_thread();
+        return NULL;
+      }
+    };
+
+    deque<Context*> read_meta_queue;
+    ReadMetaThread read_meta_thread;
+    bool read_meta_stop = false;
+    std::mutex read_meta_lock;
+    std::condition_variable read_meta_cond;
+    MetaThread() : read_meta_thread(this) {}
+    void _read_meta_start(uint32_t thread_index);
+    void _read_meta_stop();
+    void _read_meta_thread();  
+  };
+
+  //struct ReadMetaThread : public Thread {
+  //  MetaThread *m;
+  //  explicit ReadMetaThread(MetaThread *m_) : m(m_) {}
+  //  void *entry() override {
+  //    m->_read_meta_thread();
+  //    return NULL;
+  //  }
+  //};
+
   struct ReadAsyncThread : public Thread {
     BlueStore *store;
     explicit ReadAsyncThread(BlueStore *s) : store(s) {}
@@ -1985,6 +2025,14 @@ private:
   int m_finisher_num = 1;
   vector<Finisher*> finishers;
 
+  const int meta_thread_num;
+  MetaThread *read_meta_threads;
+  //deque<Context*> read_meta_queue[2];
+  //ReadMetaThread read_meta_thread[2];
+  //bool read_meta_stop[2] = {false};
+  //std::mutex read_meta_lock[2];
+  //std::condition_variable read_meta_cond[2];
+
   deque<Context*> read_async_queue; 
   ReadAsyncThread read_async_thread;
   bool read_async_stop = false;
@@ -1995,6 +2043,11 @@ public:
     std::lock_guard<std::mutex> l(read_async_lock);
     read_async_queue.push_back(ctx);
     read_async_cond.notify_one();
+  }
+  void enqueue_read_meta(Context *ctx, uint32_t thread_id) {
+    std::lock_guard<std::mutex> l(read_meta_threads[thread_id].read_meta_lock);
+    read_meta_threads[thread_id].read_meta_queue.push_back(ctx);
+    read_meta_threads[thread_id].read_meta_cond.notify_one();
   }
 private:
 
@@ -2310,7 +2363,10 @@ private:
   void _read_async_start();
   void _read_async_stop();
   void _read_async_thread();
-  
+  //void _read_meta_start(uint32_t thread_id);
+  //void _read_meta_stop(uint32_t thread_id);
+  //void _read_meta_thread(uint32_t thread_index);
+
   void _kv_start();
   void _kv_stop();
   void _kv_sync_thread();
@@ -2540,6 +2596,14 @@ public:
 	      bufferptr& value) override;
   int getattr(CollectionHandle &c, const ghobject_t& oid, const char *name,
 	      bufferptr& value) override;
+
+  int getattr(const coll_t& cid, const ghobject_t& oid, const char *name,
+        bufferptr& value, Context* ctx) override;
+  int getattr(CollectionHandle &c, const ghobject_t& oid, const char *name,
+        bufferptr& value, Context* ctx) override;
+  int getattr_callbak(OnodeRef& o, 
+                               mempool::bluestore_cache_other::string k,
+                               bufferptr &value);
 
   int getattrs(const coll_t& cid, const ghobject_t& oid,
 	       map<string,bufferptr>& aset) override;

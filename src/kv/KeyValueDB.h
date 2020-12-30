@@ -11,6 +11,7 @@
 #include "include/memory.h"
 #include <boost/scoped_ptr.hpp>
 #include "include/encoding.h"
+#include "include/Context.h"
 #include "common/Formatter.h"
 #include "common/perf_counters.h"
 #include "common/PriorityCache.h"
@@ -179,6 +180,12 @@ public:
 		  const char *key, size_t keylen,
 		  bufferlist *value) {
     return get(prefix, string(key, keylen), value);
+  }
+
+  virtual int get(const string &prefix,
+      const char *key, size_t keylen,
+      bufferlist *value, Context* ctx) {
+    return -1;
   }
 
   class GenericIteratorImpl {

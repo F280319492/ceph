@@ -51,7 +51,10 @@ private:
 public:
   Cond cond;
   int unstable_writes, readers, writers_waiting, readers_waiting;
-
+  
+  Mutex create_lock;
+  Cond create_cond;
+  bool is_complete;
 
   // any entity in obs.oi.watchers MUST be in either watchers or unconnected_watchers.
   map<pair<uint64_t, entity_name_t>, WatchRef> watchers;
@@ -301,6 +304,8 @@ public:
       destructor_callback(0),
       lock("PrimaryLogPG::ObjectContext::lock"),
       unstable_writes(0), readers(0), writers_waiting(0), readers_waiting(0),
+      create_lock("PrimaryLogPG::ObjectContext::create_lock"),
+      is_complete(false),
       blocked(false), requeue_scrub_on_unblock(false) {}
 
   ~ObjectContext() {

@@ -95,6 +95,9 @@ private:
   static const uint8_t flag_started =     1 << 3;
   static const uint8_t flag_sub_op_sent = 1 << 4;
   static const uint8_t flag_commit_sent = 1 << 5;
+  static const uint8_t flag_find_obj_begin = 1 << 6;
+  static const uint8_t flag_find_obj_end = 1 << 7;
+  static const uint8_t flag_find_obj_async = (1 << 6) + 1;
 
   std::vector<ClassInfo> classes_;
 
@@ -134,6 +137,9 @@ public:
     case flag_started: return "started";
     case flag_sub_op_sent: return "waiting for sub ops";
     case flag_commit_sent: return "commit sent; apply or cleanup";
+    case flag_find_obj_begin: return "find_object_context begin";
+    case flag_find_obj_end: return "find_object_context end";
+    case flag_find_obj_async: return "find_object_context async";
     default: break;
     }
     return "no flag points reached";
@@ -156,6 +162,15 @@ public:
   }
   void mark_commit_sent() {
     mark_flag_point(flag_commit_sent, "commit_sent");
+  }
+  void mark_ind_object_context_begin() {
+    mark_flag_point(flag_find_obj_begin, "find_object_context_begin");
+  }
+  void mark_ind_object_context_end() {
+    mark_flag_point(flag_find_obj_end, "find_object_context_end");
+  }
+  void mark_ind_object_context_async() {
+    mark_flag_point(flag_find_obj_async, "find_object_context_async");
   }
 
   utime_t get_dequeued_time() const {

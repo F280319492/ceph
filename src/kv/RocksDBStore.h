@@ -16,6 +16,7 @@
 #include "rocksdb/iostats_context.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
+#include "rocksdb/Context.h"
 #include <errno.h>
 #include "common/errno.h"
 #include "common/dout.h"
@@ -168,6 +169,7 @@ public:
 
   int64_t estimate_prefix_size(const string& prefix) override;
 
+  struct C_RocksDB_RW_OnFinish;
   struct  RocksWBHandler: public rocksdb::WriteBatch::Handler {
     std::string seen ;
     int num_seen = 0;
@@ -319,7 +321,18 @@ public:
     const char *key,
     size_t keylen,
     bufferlist *out) override;
+  int get(
+    const string &prefix,
+    const char *key,
+    size_t keylen,
+    bufferlist *out,
+    Context* ctx) override;
 
+  int get_callback(
+    rocksdb::Status& s,
+    bufferlist *out,
+    string& value,
+    utime_t& start); 
 
   class RocksDBWholeSpaceIteratorImpl :
     public KeyValueDB::WholeSpaceIteratorImpl {

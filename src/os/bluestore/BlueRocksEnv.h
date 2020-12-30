@@ -5,10 +5,15 @@
 
 #include <memory>
 #include <string>
+#include <mutex>
+#include <deque>
+#include <condition_variable> 
 
+#include "rocksdb/Context.h"
 #include "rocksdb/status.h"
 #include "rocksdb/utilities/env_mirror.h"
 
+#include "common/Thread.h"
 #include "include/assert.h"
 
 class BlueFS;
@@ -141,6 +146,12 @@ public:
   // same directory.
   rocksdb::Status GetTestDirectory(std::string* path) override;
 
+  void ScheduleAayncRead(rocksdb::Context* ctx) override {
+    std::lock_guard<std::mutex> l(read_thread_lock);
+    read_queue.push_back(ctx);
+    read_cond.notify_one();
+  }
+
   // Create and return a log file for storing informational messages.
   rocksdb::Status NewLogger(
     const std::string& fname,
@@ -150,9 +161,36 @@ public:
   rocksdb::Status GetAbsolutePath(const std::string& db_path,
       std::string* output_path) override;
 
+  void _kv_read_thread();
+  struct KVReadThread : public Thread {
+    BlueRocksEnv* env;
+    explicit KVReadThread(BlueRocksEnv *e) : env(e) {}
+    void *entry() override {
+      env->_kv_read_thread();
+      return NULL;
+    }
+  };
+
   explicit BlueRocksEnv(BlueFS *f);
+  ~BlueRocksEnv() {
+    {
+      std::unique_lock<std::mutex> l(read_thread_lock);
+      while (!read_thread_start) {
+        read_cond.wait(l);
+      }
+      read_thread_stop = true;
+      read_cond.notify_all();
+    }
+    read_thread.join();
+  }
 private:
   BlueFS *fs;
+  KVReadThread read_thread;
+  bool read_thread_stop = false;
+  bool read_thread_start = false;
+  std::mutex read_thread_lock;
+  std::condition_variable read_cond;
+  std::deque<rocksdb::Context*> read_queue;
 };
 
 #endif

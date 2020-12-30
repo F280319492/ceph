@@ -97,6 +97,13 @@ class BlueRocksRandomAccessFile : public rocksdb::RandomAccessFile {
     return rocksdb::Status::OK();
   }
 
+  rocksdb::Status AsyncRead(uint64_t offset, size_t n, rocksdb::Slice* result,
+           char* scratch, rocksdb::Context* ctx) const override {
+    int r = fs->read_random(h, offset, n, scratch, result, ctx);
+    assert(r >= 0);
+    //*result = rocksdb::Slice(scratch, r);
+    return rocksdb::Status::OK();
+  }
   // Tries to get an unique ID for this file that will be the same each time
   // the file is opened (and will stay the same while the file is open).
   // Furthermore, it tries to make this ID at most "max_size" bytes. If such an
@@ -307,9 +314,30 @@ class BlueRocksFileLock : public rocksdb::FileLock {
 
 BlueRocksEnv::BlueRocksEnv(BlueFS *f)
   : EnvWrapper(Env::Default()),  // forward most of it to POSIX
-    fs(f)
+    fs(f), read_thread(this)
 {
+  read_thread.create("rocksdb_read");
+}
 
+void BlueRocksEnv::_kv_read_thread() {
+  std::unique_lock<std::mutex> l(read_thread_lock);
+  read_thread_start = true;
+  read_cond.notify_all();
+  //l.unlock();
+  while(!read_thread_stop) {
+    if(read_queue.empty()) {
+      //l.lock();
+      read_cond.wait(l);
+    }
+    std::deque<rocksdb::Context *> read_finish;
+    //l.lock();
+    read_finish.swap(read_queue);
+    l.unlock();
+    for (auto ctx : read_finish) {
+      ctx->complete(ctx->f_s);
+    }
+    l.lock();
+  }
 }
 
 rocksdb::Status BlueRocksEnv::NewSequentialFile(
